@@ -212,6 +212,20 @@ VirtualDir PatchManager::PatchExeFS(VirtualDir exefs) const {
 
                 if (!manual_update_versions.empty()) {
                     checked_manual = true;
+                    // The frontend adds every NCA of the file being booted to
+                    // this provider, so for an XCI carrying an on-cart update
+                    // that update shows up here - and this loop takes the FIRST
+                    // enabled entry, not the highest version. A newer update
+                    // installed to NAND therefore loses to the cartridge's,
+                    // which is how the target title boots its A32 2.4.0
+                    // update while the A64 4.0.0 sits unused in NAND.
+                    for (const auto& update_entry : manual_update_versions) {
+                        LOG_INFO(Loader,
+                                 "DIAG update candidate (manual): version={} ({}.{}.{}) tid={:016X}",
+                                 update_entry.version, (update_entry.version >> 26) & 0x3F,
+                                 (update_entry.version >> 20) & 0x3F,
+                                 (update_entry.version >> 16) & 0xF, update_tid);
+                    }
                     for (const auto& update_entry : manual_update_versions) {
                         if (!IsVersionedExternalUpdateDisabled(disabled, update_entry.version)) {
                             update_disabled = false;
@@ -293,6 +307,17 @@ VirtualDir PatchManager::PatchExeFS(VirtualDir exefs) const {
 
     // Fallback to regular content provider if no external update was loaded
     if (update == nullptr && !update_disabled) {
+        // Which provider actually answers matters: the union checks SysNAND,
+        // UserNAND, SDMC, FrontendManual, External in that order, and the
+        // frontend puts every NCA of the booted file into FrontendManual - so
+        // an on-cart update can answer here even when a newer one is installed
+        // to NAND. Naming the slot is the difference between knowing that and
+        // guessing at it.
+        if (content_union) {
+            const auto slot = content_union->GetSlotForEntry(update_tid, ContentRecordType::Program);
+            LOG_INFO(Loader, "DIAG update source: tid={:016X} slot={}", update_tid,
+                     slot.has_value() ? static_cast<int>(*slot) : -1);
+        }
         update = content_provider.GetEntry(update_tid, ContentRecordType::Program);
     }
 
