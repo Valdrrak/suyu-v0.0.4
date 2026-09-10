@@ -2387,7 +2387,53 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
         rc += "};\n";
     }
     rc += "#define _NSEG (sizeof(_segs)/sizeof(_segs[0]))\n"
+          "/* Direct block index.\n"
+          "\n"
+          "   Every block boundary lands in recomp_lookup - tens of millions of\n"
+          "   times a second - and it used to run two binary searches, one over\n"
+          "   segments and one over a segment's entries, which for the main image\n"
+          "   means about twenty probes over 600k entries per dispatch.\n"
+          "\n"
+          "   Guest instructions are 4-byte aligned and a module's blocks span one\n"
+          "   contiguous address range, so (pc - lo) >> 2 indexes a flat array\n"
+          "   directly. One bounds check and one load, no search.\n"
+          "\n"
+          "   Built once from the sorted tables at load time and read-only after,\n"
+          "   so it needs no locking and no per-thread state - a thread-local\n"
+          "   cache was tried instead and cost 34%% in the race phase, because the\n"
+          "   footprint per thread stops being free once the title is actually\n"
+          "   using its threads.\n"
+          "\n"
+          "   Costs one pointer per guest instruction word in the module, so about\n"
+          "   24 MB for a 3M-instruction image. If the allocation fails the binary\n"
+          "   search below still answers, just slowly. */\n"
+          "static BlockFn* _idx = 0;\n"
+          "static uint64_t _idx_lo = 0, _idx_hi = 0;\n"
+          "static int _idx_tried = 0;\n"
+          "static void _build_idx(void){\n"
+          "  size_t i, j, n;\n"
+          "  if(_idx_tried) return;\n"
+          "  _idx_tried = 1;\n"
+          "  if(_NSEG == 0 || *_segn[0] == 0) return;\n"
+          "  _idx_lo = _segs[0][0].va;\n"
+          "  _idx_hi = _seg_hi[_NSEG-1];\n"
+          "  if(_idx_hi < _idx_lo) return;\n"
+          "  n = (size_t)((_idx_hi - _idx_lo) >> 2) + 1;\n"
+          "  _idx = (BlockFn*)calloc(n, sizeof(BlockFn));\n"
+          "  if(!_idx) return;\n"
+          "  for(i=0;i<_NSEG;i++){\n"
+          "    const struct _recomp_ent* t=_segs[i];\n"
+          "    unsigned m=*_segn[i];\n"
+          "    for(j=0;j<m;j++) _idx[(size_t)((t[j].va - _idx_lo) >> 2)] = t[j].fn;\n"
+          "  }\n"
+          "}\n"
+          "/* Called from recomp_image_set_base, which the loader runs once per\n"
+          "   module before any guest thread exists - so the build below is not\n"
+          "   racing anything. */\n"
+          "void recomp_build_index(void){ _build_idx(); }\n"
           "BlockFn recomp_lookup(uint64_t pc){\n"
+          "  if(_idx && pc>=_idx_lo && pc<=_idx_hi) return _idx[(size_t)((pc-_idx_lo)>>2)];\n"
+          "  {\n"
           "  unsigned slo=0, shi=(unsigned)_NSEG;\n"
           "  while(slo<shi){ unsigned m=slo+(shi-slo)/2; if(_seg_hi[m]<pc) slo=m+1; else shi=m; }\n"
           "  if(slo>=_NSEG) return 0;\n"
@@ -2396,6 +2442,7 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
           "    unsigned n=*_segn[slo], lo=0, hi=n;\n"
           "    while(lo<hi){ unsigned m=lo+(hi-lo)/2; if(t[m].va<pc) lo=m+1; else hi=m; }\n"
           "    return (lo<n && t[lo].va==pc)?t[lo].fn:0;\n"
+          "  }\n"
           "  }\n}\n";
 
     const std::string title_str = display_title.empty() ? mod : display_title;
@@ -2631,7 +2678,10 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
           "RECOMP_API BlockFn recomp_image_lookup(uint64_t pc){ return recomp_lookup(pc - g_module_base); }\n\n"
           "/* Tells this image where its module actually got loaded, so the\n"
           "   addresses it computes are real rather than module-relative. */\n"
-          "RECOMP_API void recomp_image_set_base(uint64_t base){ g_module_base = base; }\n\n"
+          "RECOMP_API void recomp_image_set_base(uint64_t base){ g_module_base = base;\n"
+          "  /* Single-threaded here, which is what makes the index safe to\n"
+          "     build without locking. */\n"
+          "  recomp_build_index(); }\n\n"
           "/* Reports the entry PC so the loader does not have to be told it\n"
           "   separately or parse the image again. */\n"
        << "RECOMP_API uint64_t recomp_image_entry(void){ return 0x"
@@ -2741,7 +2791,14 @@ inline const char* RuntimeH() {
 #define SUYU_RECOMP_RUNTIME_H
 #include <stdint.h>
 #include <stddef.h>   /* offsetof, for the layout assertions below */
-#include <string.h>   /* memcpy, for the inline memory accessors */
+#include <string.h>   /* memcpy, for the memory accessors */
+#include <stdlib.h>   /* calloc, for the block index
+
+   Included here rather than in the generated module source because the module
+   source only pulls in this header and <stdint.h>. Without it calloc is an
+   implicit declaration returning int, the returned pointer is truncated to 32
+   bits, and the first lookup through the index dereferences garbage - which is
+   a crash roughly 20 seconds into boot with nothing in the log to explain it. */
 
 /* The memory accessors below are the hottest code in a generated module, and
    leaving them to the compiler's discretion is not worth the risk: without a
@@ -2891,6 +2948,9 @@ extern uint64_t g_module_base;
 
 typedef void (*BlockFn)(GuestContext*);
 BlockFn recomp_lookup(uint64_t pc); void recomp_run(GuestContext* c);
+/* Builds the direct block index. Called once at load, before any
+   guest thread runs. */
+void recomp_build_index(void);
 void recomp_set_flags(GuestContext*,int,uint64_t,uint64_t,uint64_t,int);
 /* High 64 bits of a 64x64 multiply, for SMULH/UMULH. */
 uint64_t recomp_smulh(uint64_t,uint64_t);
@@ -2898,18 +2958,14 @@ uint64_t recomp_umulh(uint64_t,uint64_t);
 int  recomp_cond(GuestContext*,unsigned);
 /* Guest memory access.
 
-   These are inline rather than calls into recomp_runtime.c because they are the
-   hottest thing the generated code does - one basic block can contain a dozen -
-   and the whole cost used to be a cross-translation-unit call followed by an
-   indirect call into the emulator, per access.
+   Defined once per module in recomp_runtime.c rather than inlined here. They
+   resolve the address through the host page table the same way
+   Memory::GetPointerImpl does, falling back to the emulator callback for
+   unmapped, debug or GPU-tracked pages.
 
-   recomp_host_ptr resolves an address the same way Memory::GetPointerImpl does.
-   When it returns non-null the access is a plain memcpy; otherwise the slow
-   path runs, which is the emulator callback when hosted and the standalone
-   arena when not. memcpy rather than a cast because guest accesses are not
-   guaranteed aligned and a misaligned load through a pointer cast is undefined;
-   every compiler that matters turns a fixed-size memcpy into the single
-   instruction anyway. */
+   Forcing them inline at every access site was measured and was worse: the
+   generated main image went from 100 MB to 222 MB and the race-phase frame rate
+   dropped 14%. Whatever the call costs, the instruction cache costs more. */
 uint64_t recomp_load8(GuestContext*,uint64_t); uint64_t recomp_load16(GuestContext*,uint64_t);
 uint64_t recomp_load32(GuestContext*,uint64_t); uint64_t recomp_load64(GuestContext*,uint64_t);
 void recomp_store8(GuestContext*,uint64_t,uint64_t); void recomp_store16(GuestContext*,uint64_t,uint64_t);
