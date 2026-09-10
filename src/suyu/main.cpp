@@ -5533,6 +5533,18 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                         OnConfigure();
                     } else if (action == QStringLiteral("toggle_fullscreen")) {
                         ToggleFullscreen();
+                    // TAS playback and recording, exposed so a benchmark can
+                    // replay a recorded run without a human at the keyboard.
+                    // Reaching the same point in a real race repeatedly is the
+                    // only way to compare two CPU backends on the workload that
+                    // actually matters; the attract sequence varies run to run
+                    // and savestates do not exist.
+                    } else if (action == QStringLiteral("tas_start_stop")) {
+                        OnTasStartStop();
+                    } else if (action == QStringLiteral("tas_record")) {
+                        OnTasRecord();
+                    } else if (action == QStringLiteral("tas_reset")) {
+                        OnTasReset();
                     } else if (action == QStringLiteral("install_firmware_dialog")) {
                         OnInstallFirmware();
                     } else if (action == QStringLiteral("install_keys_dialog")) {
@@ -6403,6 +6415,29 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir) {
     // function pointer is required here, so the table has to be reached via
     // a namespace-scope static rather than a capture.
     static const auto chained = [](u64 pc) -> Core::RecompBlockFn {
+        // Most block boundaries stay inside the module that owned the previous
+        // one, so remember which that was and try it before scanning. The scan
+        // itself is short - nine images at most - but it runs tens of millions
+        // of times a second, and each iteration touches a separate record.
+        //
+        // A plain int, not thread-local: an aligned int cannot tear, and being
+        // wrong is harmless. A wrong image's lookup returns null (its index is
+        // bounds-checked against its own address range) and the full scan below
+        // runs anyway, so the worst case is one wasted call. That is what makes
+        // this safe to share across threads where a (pc, fn) cache was not.
+        static int last_owner_hint = -1;
+        {
+            const int hint = last_owner_hint;
+            if (hint >= 0 && static_cast<size_t>(hint) < loaded_records.size()) {
+                auto& record = loaded_records[hint];
+                if (record.base != 0 && record.base <= pc) {
+                    if (auto* block = record.lookup(pc)) {
+                        return block;
+                    }
+                }
+            }
+        }
+
         RecompImage* owner = nullptr;
         for (auto& record : loaded_records) {
             if (record.base != 0 && record.base <= pc &&
@@ -6417,6 +6452,7 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir) {
             // every single time - which is why the AOT path executed zero
             // blocks and silently ran everything on the JIT instead.
             if (auto* block = owner->lookup(pc)) {
+                last_owner_hint = static_cast<int>(owner - loaded_records.data());
                 return block;
             }
             // An owner was found and simply had no block at that offset. That is
