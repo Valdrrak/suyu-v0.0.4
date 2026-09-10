@@ -576,6 +576,14 @@ private:
     QLabel* res_scale_label = nullptr;
     QLabel* emu_speed_label = nullptr;
     QLabel* game_fps_label = nullptr;
+
+    // Last perf sample, kept so the MCP state tool can report it.
+    // GetAndResetPerfStats() clears the counters, so whoever calls it takes the
+    // numbers away from everyone else - the status bar and a poller cannot both
+    // call it. Cached here on the status bar's tick instead.
+    std::atomic<double> last_game_fps_{0.0};
+    std::atomic<double> last_frame_ms_{0.0};
+    std::atomic<double> last_emu_speed_{0.0};
     QLabel* emu_frametime_label = nullptr;
     QLabel* tas_label = nullptr;
     QLabel* firmware_label = nullptr;

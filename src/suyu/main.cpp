@@ -5067,6 +5067,17 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                 emu_thread ? emu_thread->IsRunning() : false;
             state[QStringLiteral("first_frame_displayed")] =
                 render_window ? render_window->IsLoadingComplete() : false;
+            // The tool has always advertised an "fps" field and never filled it
+            // in, so callers got null and had to read the status bar off a
+            // screenshot. Served from the cache above rather than by calling
+            // GetAndResetPerfStats here, which would reset the counters and
+            // corrupt the status bar's own reading.
+            state[QStringLiteral("fps")] = last_game_fps_.load(std::memory_order_relaxed);
+            state[QStringLiteral("frame_ms")] = last_frame_ms_.load(std::memory_order_relaxed);
+            state[QStringLiteral("emulation_speed")] =
+                last_emu_speed_.load(std::memory_order_relaxed);
+            state[QStringLiteral("shaders_building")] =
+                (emulation_running && system) ? system->GPU().ShaderNotify().ShadersBuilding() : 0;
             state[QStringLiteral("qt_ssl_available")] = qt_ssl_available_;
             state[QStringLiteral("qt_ssl_build_version")] = qt_ssl_build_version_;
             state[QStringLiteral("qt_ssl_runtime_version")] = qt_ssl_runtime_version_;
@@ -7067,6 +7078,9 @@ void GMainWindow::UpdateStatusBar() {
     }
 
     auto results = system->GetAndResetPerfStats();
+    last_game_fps_.store(results.average_game_fps, std::memory_order_relaxed);
+    last_frame_ms_.store(results.frametime * 1000.0, std::memory_order_relaxed);
+    last_emu_speed_.store(results.emulation_speed, std::memory_order_relaxed);
     auto& shader_notify = system->GPU().ShaderNotify();
     const int shaders_building = shader_notify.ShadersBuilding();
 
