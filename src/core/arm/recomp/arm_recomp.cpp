@@ -80,8 +80,36 @@ struct RecompHostMem {
     u64 (*read_cntpct)(void* user);
     // Exclusive pair forms; `size` is the width of one register, 4 or 8.
     void (*excl_load_pair)(void* user, u64 va, u32 size, u64* lo, u64* hi);
+    // Page table, so generated code can resolve a mapped address inline instead
+    // of calling out for every load and store. Mirrors GetPointerImpl's fast
+    // path; a null backing pointer (unmapped, debug, or GPU-tracked memory)
+    // falls through to `load`/`store` so rasterizer invalidation still happens.
     u32 (*excl_store_pair)(void* user, u64 va, u32 size, u64 lo, u64 hi);
+    const void* page_entries;
+    u64 page_entry_stride;
+    u64 page_bits;
+    u64 pointer_mask;
+    u64 address_space_max;
 };
+
+// This struct is duplicated by hand in the emitter (arm64_to_c.h, RuntimeH's
+// RecompHostMem) because the generated project is plain C and shares no headers
+// with the emulator. Nothing links the two, so a field added in the middle of
+// one and at the end of the other compiles cleanly on both sides and hands the
+// generated code a function pointer where it expects data.
+//
+// That is not hypothetical: inserting the page-table fields after
+// excl_load_pair here, while the emitter appended them after excl_store_pair,
+// made recompiled code dereference excl_store_pair's code pointer as a page
+// table. suyu died during boot with no diagnostic. Hence these.
+static_assert(offsetof(RecompHostMem, excl_load_pair) == 56);
+static_assert(offsetof(RecompHostMem, excl_store_pair) == 64);
+static_assert(offsetof(RecompHostMem, page_entries) == 72);
+static_assert(offsetof(RecompHostMem, page_entry_stride) == 80);
+static_assert(offsetof(RecompHostMem, page_bits) == 88);
+static_assert(offsetof(RecompHostMem, pointer_mask) == 96);
+static_assert(offsetof(RecompHostMem, address_space_max) == 104);
+static_assert(sizeof(RecompHostMem) == 112);
 
 // Nothing links these two builds together, so the shared layout is pinned on
 // both sides: the generated runtime asserts the same four offsets against its
@@ -315,6 +343,9 @@ struct ArmRecomp::Impl {
         bridge.read_cntpct = &Impl::HostReadCntpct;
         bridge.excl_load_pair = &Impl::HostExclusiveLoadPair;
         bridge.excl_store_pair = &Impl::HostExclusiveStorePair;
+        // Filled in by RefreshPageTable once a process exists; until then the
+        // fields stay null and every access takes the callback path.
+        bridge.page_entries = nullptr;
         ctx.host_mem = &bridge;
     }
 
@@ -397,6 +428,21 @@ struct ArmRecomp::Impl {
                 core, va, static_cast<u32>(lo) | (static_cast<u64>(static_cast<u32>(hi)) << 32));
         }
         return ok ? 0u : 1u;
+    }
+
+    /// Re-read the page table description into the bridge.
+    ///
+    /// Called on entry to a run rather than once at construction: the table
+    /// belongs to the process, and the pointer is not valid until one exists.
+    /// A stale pointer here would have generated code reading another address
+    /// space, so it is refreshed rather than cached forever.
+    void RefreshPageTable() {
+        const auto view = system.ApplicationMemory().GetPageTableView();
+        bridge.page_entries = view.entries;
+        bridge.page_entry_stride = view.entry_stride;
+        bridge.page_bits = view.page_bits;
+        bridge.pointer_mask = view.pointer_mask;
+        bridge.address_space_max = view.address_space_max;
     }
 
     /// The same source DynarmicCallbacks64::GetCNTPCT uses, so a guest thread
@@ -878,6 +924,8 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
         LOG_ERROR(Core_ARM, "No recompiled code registered; cannot run thread");
         return HaltReason::BreakLoop;
     }
+
+    impl->RefreshPageTable();
 
     // Registering every loaded image's base with the host dispatcher is a
     // side effect of this call, not something its return value is used for

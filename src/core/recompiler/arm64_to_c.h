@@ -2741,6 +2741,19 @@ inline const char* RuntimeH() {
 #define SUYU_RECOMP_RUNTIME_H
 #include <stdint.h>
 #include <stddef.h>   /* offsetof, for the layout assertions below */
+#include <string.h>   /* memcpy, for the inline memory accessors */
+
+/* The memory accessors below are the hottest code in a generated module, and
+   leaving them to the compiler's discretion is not worth the risk: without a
+   forced inline MSVC declines them at /O2 in the larger translation units,
+   which puts a call back on the path this exists to remove. */
+#if defined(_MSC_VER)
+#define RECOMP_INLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+#define RECOMP_INLINE inline __attribute__((always_inline))
+#else
+#define RECOMP_INLINE inline
+#endif
 
 /* Supplied by the host when the recompiled image is driven by an emulator
    rather than run standalone. `size` is 1, 2, 4 or 8 bytes. */
@@ -2773,6 +2786,22 @@ typedef struct RecompHostMem {
                            uint64_t* hi);
     uint32_t (*excl_store_pair)(void* user, uint64_t va, uint32_t size, uint64_t lo,
                                 uint64_t hi);
+    /* The host page table, so a mapped access resolves inline rather than
+       through `load`/`store`. Mirrors Memory::GetPointerImpl's fast path: mask
+       the address, bounds check, read one entry, extract the backing pointer.
+
+       An entry whose pointer is null means unmapped, debug, or GPU-tracked
+       memory - all of which need the callback, because the rasterizer has to be
+       told about the access. Only a non-null pointer is handled inline, so
+       nothing is bypassed that suyu would have done itself.
+
+       page_entries is null until the emulator hands over a real page table;
+       standalone builds leave it null and take the callback path always. */
+    const void* page_entries;
+    uint64_t page_entry_stride;
+    uint64_t page_bits;
+    uint64_t pointer_mask;
+    uint64_t address_space_max;
 } RecompHostMem;
 
 typedef struct GuestContext {
@@ -2867,6 +2896,20 @@ void recomp_set_flags(GuestContext*,int,uint64_t,uint64_t,uint64_t,int);
 uint64_t recomp_smulh(uint64_t,uint64_t);
 uint64_t recomp_umulh(uint64_t,uint64_t);
 int  recomp_cond(GuestContext*,unsigned);
+/* Guest memory access.
+
+   These are inline rather than calls into recomp_runtime.c because they are the
+   hottest thing the generated code does - one basic block can contain a dozen -
+   and the whole cost used to be a cross-translation-unit call followed by an
+   indirect call into the emulator, per access.
+
+   recomp_host_ptr resolves an address the same way Memory::GetPointerImpl does.
+   When it returns non-null the access is a plain memcpy; otherwise the slow
+   path runs, which is the emulator callback when hosted and the standalone
+   arena when not. memcpy rather than a cast because guest accesses are not
+   guaranteed aligned and a misaligned load through a pointer cast is undefined;
+   every compiler that matters turns a fixed-size memcpy into the single
+   instruction anyway. */
 uint64_t recomp_load8(GuestContext*,uint64_t); uint64_t recomp_load16(GuestContext*,uint64_t);
 uint64_t recomp_load32(GuestContext*,uint64_t); uint64_t recomp_load64(GuestContext*,uint64_t);
 void recomp_store8(GuestContext*,uint64_t,uint64_t); void recomp_store16(GuestContext*,uint64_t,uint64_t);
@@ -2901,7 +2944,11 @@ int  recomp_load_segments(GuestContext* c, const char* data_dir);
 }
 
 inline const char* RuntimeC() {
-    return R"RT(#include "recomp_runtime.h"
+    // MSVC caps one string literal at 16380 bytes (C2026) and this runtime is
+    // past that, so it is assembled from two pieces at first use rather than
+    // being a single literal. Adjacent-literal concatenation would not help:
+    // the limit applies to the result as well.
+    static const std::string text = std::string(R"RT(#include "recomp_runtime.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -3004,14 +3051,43 @@ uint64_t recomp_cntpct(GuestContext* c){
   }
 }
 
-uint64_t recomp_load8 (GuestContext* c,uint64_t a){return memload(c,a,1);}
-uint64_t recomp_load16(GuestContext* c,uint64_t a){return memload(c,a,2);}
-uint64_t recomp_load32(GuestContext* c,uint64_t a){return memload(c,a,4);}
-uint64_t recomp_load64(GuestContext* c,uint64_t a){return memload(c,a,8);}
-void recomp_store8 (GuestContext* c,uint64_t a,uint64_t v){memstore(c,a,1,v);}
-void recomp_store16(GuestContext* c,uint64_t a,uint64_t v){memstore(c,a,2,v);}
-void recomp_store32(GuestContext* c,uint64_t a,uint64_t v){memstore(c,a,4,v);}
-void recomp_store64(GuestContext* c,uint64_t a,uint64_t v){memstore(c,a,8,v);}
+/* Resolve a guest address to a host pointer the way Memory::GetPointerImpl
+   does: mask, bounds check, one page-table entry, extract the backing pointer.
+   A null result means unmapped, debug, or GPU-tracked memory, all of which have
+   to go through the emulator callback so the rasterizer is told about the
+   access. Only a real backing pointer is handled here.
+
+   Deliberately not inlined into the generated code. Forcing it inline at every
+   access site was measured: main.dll went from 100 MB to 222 MB and the race
+   phase lost 14%, so whatever the call cost, the instruction cache cost more. */
+static unsigned char* recomp_host_ptr(GuestContext* c, uint64_t va){
+  const RecompHostMem* hm = c->host_mem;
+  uintptr_t raw, p;
+  if(!hm || !hm->page_entries) return 0;
+  va &= 0xffffffffffffULL;                 /* AArch64 ignores the top 16 bits */
+  if(va >= hm->address_space_max) return 0;
+  raw = *(const uintptr_t*)((const unsigned char*)hm->page_entries
+                            + (va >> hm->page_bits) * hm->page_entry_stride);
+  p = raw & (uintptr_t)hm->pointer_mask;
+  return p ? (unsigned char*)(p + (uintptr_t)va) : 0;
+}
+
+uint64_t recomp_load8 (GuestContext* c,uint64_t a){
+  unsigned char* p=recomp_host_ptr(c,a); if(p) return (uint64_t)*p; return memload(c,a,1);}
+uint64_t recomp_load16(GuestContext* c,uint64_t a){
+  unsigned char* p=recomp_host_ptr(c,a); if(p){uint16_t v;memcpy(&v,p,2);return (uint64_t)v;} return memload(c,a,2);}
+uint64_t recomp_load32(GuestContext* c,uint64_t a){
+  unsigned char* p=recomp_host_ptr(c,a); if(p){uint32_t v;memcpy(&v,p,4);return (uint64_t)v;} return memload(c,a,4);}
+uint64_t recomp_load64(GuestContext* c,uint64_t a){
+  unsigned char* p=recomp_host_ptr(c,a); if(p){uint64_t v;memcpy(&v,p,8);return v;} return memload(c,a,8);}
+void recomp_store8 (GuestContext* c,uint64_t a,uint64_t v){
+  unsigned char* p=recomp_host_ptr(c,a); if(p){*p=(unsigned char)v;return;} memstore(c,a,1,v);}
+void recomp_store16(GuestContext* c,uint64_t a,uint64_t v){
+  unsigned char* p=recomp_host_ptr(c,a); if(p){uint16_t t=(uint16_t)v;memcpy(p,&t,2);return;} memstore(c,a,2,v);}
+void recomp_store32(GuestContext* c,uint64_t a,uint64_t v){
+  unsigned char* p=recomp_host_ptr(c,a); if(p){uint32_t t=(uint32_t)v;memcpy(p,&t,4);return;} memstore(c,a,4,v);}
+void recomp_store64(GuestContext* c,uint64_t a,uint64_t v){
+  unsigned char* p=recomp_host_ptr(c,a); if(p){memcpy(p,&v,8);return;} memstore(c,a,8,v);}
 
 #ifndef RECOMP_STATIC_HOST
 /* Owned by the runtime in the single-module shapes (standalone exe, loadable
@@ -3081,7 +3157,7 @@ int recomp_save_write(GuestContext* c, const char* name, const void* data, uint6
   /* Ensure parent dirs exist */
   char parent[1024]; snprintf(parent,sizeof parent,"%s",path);
   char* sl=strrchr(parent,PATH_SEP); if(!sl) sl=strrchr(parent,'/'); if(sl)*sl=0;
-  mkpath(parent);
+)RT") + R"RT(  mkpath(parent);
   FILE* f=fopen(path,"wb");
   if(!f){fprintf(stderr,"[recomp] save write failed: %s\n",path); return 0;}
   fwrite(data,1,(size_t)size,f); fclose(f);
@@ -3314,6 +3390,7 @@ void recomp_run(GuestContext* c){
 }
 #endif /* !RECOMP_STATIC_HOST */
 )RT";
+    return text.c_str();
 }
 
 } // namespace suyu::recomp

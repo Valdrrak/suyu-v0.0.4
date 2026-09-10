@@ -805,6 +805,23 @@ void Memory::ProtectRegion(Common::PageTable& page_table, Common::ProcessAddress
     impl->ProtectRegion(page_table, GetInteger(vaddr), size, perms);
 }
 
+Memory::PageTableView Memory::GetPageTableView() const {
+    if (!impl->current_page_table) {
+        return {};
+    }
+    const auto& pt = *impl->current_page_table;
+    return {
+        .entries = pt.entries.data(),
+        .entry_stride = sizeof(Common::PageTable::PageEntryData),
+        .page_bits = YUZU_PAGEBITS,
+        // PageInfo::ExtractPointer. Kept here rather than duplicated as a
+        // literal on the C side so the two cannot drift apart.
+        .pointer_mask =
+            static_cast<u64>(~uintptr_t{0} << Common::PageTable::ATTRIBUTE_BITS),
+        .address_space_max = u64{1} << pt.GetAddressSpaceBits(),
+    };
+}
+
 bool Memory::IsValidVirtualAddress(const Common::ProcessAddress vaddr) const {
     const auto& page_table = *impl->current_page_table;
     const size_t page = vaddr >> YUZU_PAGEBITS;
