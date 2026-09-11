@@ -59,6 +59,10 @@ struct GuestContextView {
     // was silently reset to the host default on every engine transition.
     u64 fpcr;
     u64 fpsr;
+    // Must sit here rather than at the end: the emitted struct continues with
+    // heap bookkeeping this view does not model, so a field appended after that
+    // point would be at a different offset on each side.
+    int chain_budget;
 };
 
 // Matches RecompHostMem in the generated runtime. The recompiled code calls
@@ -120,6 +124,19 @@ static_assert(offsetof(GuestContextView, pc) == 256);
 static_assert(offsetof(GuestContextView, pending_svc) == 304);
 static_assert(offsetof(GuestContextView, vreg) == 312);
 static_assert(offsetof(GuestContextView, tpidr_el0) == 824);
+static_assert(offsetof(GuestContextView, chain_budget) == 864);
+
+// Blocks a chain of direct calls may run before returning here. Only this side
+// sets it - the generated code just decrements - so the emitter does not need
+// to agree on the value.
+//
+// It bounds two things. How long a guest loop can run without the interrupt and
+// SVC checks below getting a look in; and, because the generated calls are not
+// guaranteed to be tail calls, how deep the host stack goes. Guest threads run
+// on 512 KB fibers (common/fiber.cpp) and a block frame carrying SIMD locals is
+// not small, so this has to stay well under what that stack can hold. 256
+// overflowed it and crashed on boot.
+constexpr int kChainBudget = 32;
 static_assert(offsetof(GuestContextView, host_mem) == 832);
 static_assert(offsetof(GuestContextView, tpidrro_el0) == 840);
 static_assert(offsetof(GuestContextView, fpcr) == 848);
@@ -1124,7 +1141,20 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
              0x3FFFFULL) == 0x3FFFFULL) {
             WriteRecompCoverageFile(FormatRecompCoverage());
         }
+        // Generated code calls a direct branch's target itself rather than
+        // coming back here, so one call below can run a whole chain of blocks.
+        // The budget bounds that chain, and what is left of it afterwards says
+        // how many blocks actually ran - without which every count here would
+        // report chains rather than blocks.
+        impl->ctx.chain_budget = kChainBudget;
         block(&impl->ctx);
+        {
+            const int spent = kChainBudget - impl->ctx.chain_budget;
+            if (spent > 1) {
+                g_counters.static_blocks.fetch_add(static_cast<u64>(spent - 1),
+                                                   std::memory_order_relaxed);
+            }
+        }
 
         // The block stopped on an instruction the decoder has no translation
         // for, having parked the PC on that instruction. Running it on the JIT

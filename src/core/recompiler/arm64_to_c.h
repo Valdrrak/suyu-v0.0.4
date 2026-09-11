@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <unordered_set>
 #include <map>
 #include <string>
 #include <string_view>
@@ -252,6 +253,30 @@ inline bool DecodeBitMasks(u32 N, u32 imms, u32 immr, bool is64, u64& out) {
     out = result;
     return true;
 }
+
+inline std::string FuncName(const std::string& mod, u64 v) {
+    char b[64]; snprintf(b, sizeof b, "blk_%s_%016llx", mod.c_str(), (unsigned long long)v); return b;
+}
+
+// Same name, written into a caller-owned buffer. The emit loops call this once
+// per block for the body and twice more per block for the dispatch table, so on
+// a multi-million-block title the returned-std::string form above is millions of
+// heap allocations for a name that is always well under 64 bytes.
+inline size_t FuncNameTo(char (&b)[64], const char* mod, u64 v) {
+    return (size_t)snprintf(b, sizeof b, "blk_%s_%016llx", mod, (unsigned long long)v);
+}
+
+// Set by the emit loop so a direct branch whose target is a known block start
+// can call that block instead of returning to the dispatcher. Null while the
+// decode tests run, which is what keeps their expected output stable.
+inline const std::unordered_set<u64>* g_chain_blocks = nullptr;
+inline const char* g_chain_mod = nullptr;
+
+// How many blocks may run before control goes back to the dispatcher. The
+// dispatcher checks for interrupts and services SVCs between blocks, so an
+// unbounded chain would let a guest loop run uninterruptibly; it also derives
+// the executed-block count from how much of this budget was spent.
+inline constexpr int kChainBudget = 256;
 
 inline std::string Xz(u32 r) {
     return r == 31 ? std::string("(uint64_t)0") : ("c->x[" + std::to_string(r) + "]");
@@ -521,6 +546,22 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
     if (((i & 0xFC000000) == 0x14000000 || (i & 0xFC000000) == 0x94000000) &&
         DirectBranchTarget(i, pc, t)) {
         if ((i & 0xFC000000) == 0x94000000) { snprintf(buf, sizeof buf, "c->x[30]=g_module_base+0x%llxULL;", (unsigned long long)next); put(buf); }
+        // Call the target block directly when it is one we emitted. The
+        // declaration is at block scope so a unit needs no list of the blocks it
+        // reaches, and `return f(c)` gives the compiler a sibling call, which
+        // keeps the chain from growing the stack. Falling out of budget parks
+        // the PC and returns exactly as before, so the dispatcher stays the only
+        // thing that decides what runs when a chain ends.
+        if (g_chain_blocks && g_chain_mod && g_chain_blocks->count(t)) {
+            char nm[64];
+            FuncNameTo(nm, g_chain_mod, t);
+            snprintf(buf, sizeof buf,
+                     "{ void %s(GuestContext*); if (--c->chain_budget <= 0) "
+                     "{ c->pc=g_module_base+0x%llxULL; return; } return %s(c); }",
+                     nm, (unsigned long long)t, nm);
+            put(buf);
+            return false;
+        }
         snprintf(buf, sizeof buf, "c->pc=g_module_base+0x%llxULL; return;", (unsigned long long)t); put(buf); return false;
     }
     if ((i & 0xFFFFFC1F) == 0xD65F0000) { put("c->pc=c->x[30]; return; /* RET */"); return false; }
@@ -2409,17 +2450,6 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
     return true;
 }
 
-inline std::string FuncName(const std::string& mod, u64 v) {
-    char b[64]; snprintf(b, sizeof b, "blk_%s_%016llx", mod.c_str(), (unsigned long long)v); return b;
-}
-
-// Same name, written into a caller-owned buffer. The emit loops call this once
-// per block for the body and twice more per block for the dispatch table, so on
-// a multi-million-block title the returned-std::string form above is millions of
-// heap allocations for a name that is always well under 64 bytes.
-inline size_t FuncNameTo(char (&b)[64], const char* mod, u64 v) {
-    return (size_t)snprintf(b, sizeof b, "blk_%s_%016llx", mod, (unsigned long long)v);
-}
 
 const char* RuntimeH();
 const char* RuntimeC();
@@ -2596,6 +2626,22 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
                  hi - lo);
         rcu += line;
     };
+
+    // Every block's address, so a direct branch can be turned into a direct call
+    // when its target is a block we actually emitted.
+    std::unordered_set<u64> chain_blocks;
+    chain_blocks.reserve(blocks.size() * 2);
+    for (const auto& b : blocks) {
+        chain_blocks.insert(b.vaddr);
+    }
+    g_chain_blocks = &chain_blocks;
+    g_chain_mod = mod.c_str();
+    struct ChainScope {
+        ~ChainScope() {
+            g_chain_blocks = nullptr;
+            g_chain_mod = nullptr;
+        }
+    } chain_scope;
 
     size_t cur_unit = 0;
     for (const auto& b : blocks) {
@@ -3211,6 +3257,12 @@ typedef struct GuestContext {
        Appended after tpidrro_el0 so every pinned offset above is unchanged. */
     uint64_t fpcr;
     uint64_t fpsr;
+    /* Blocks a chain of direct calls may still run before returning to the
+       dispatcher. It has to sit immediately after fpsr: Core::ArmRecomp mirrors
+       this struct by hand and its view ends here, so a field placed after
+       save_dir below lands 512 bytes further along on this side than on that
+       one. The layout assertions below are what catch that. */
+    int chain_budget;
     /* Save-data filesystem state */
     char save_dir[512];
     /* Heap break for SVC memory allocation */
@@ -3238,6 +3290,7 @@ typedef char recomp_layout_tpidr[offsetof(GuestContext, tpidr_el0) == 824 ? 1 : 
 typedef char recomp_layout_fpcr[offsetof(GuestContext, fpcr) == 848 ? 1 : -1];
 typedef char recomp_layout_fpsr[offsetof(GuestContext, fpsr) == 856 ? 1 : -1];
 typedef char recomp_layout_host[offsetof(GuestContext, host_mem) == 832 ? 1 : -1];
+typedef char recomp_layout_chain[offsetof(GuestContext, chain_budget) == 864 ? 1 : -1];
 typedef char recomp_layout_tpidrro[offsetof(GuestContext, tpidrro_el0) == 840 ? 1 : -1];
 
 /* Where this module is actually loaded in the guest's address space.
