@@ -1445,6 +1445,25 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 }
             }
 
+            // FCCMP / FCCMPE: compare when the condition holds, otherwise take
+            // the flags straight from nzcv. Bits 11..10 are 01 here, where an
+            // ordinary FCMP has 1000 in bits 13..10, so the two do not overlap.
+            if (((i >> 10) & 3) == 1) {
+                const u32 cond = (i >> 12) & 15, nzcv = i & 15;
+                std::string s = "{ if (recomp_cond(c," + std::to_string(cond) + ")) ";
+                s += ld_n + ld_m;
+                s += "if (_a != _a || _b != _b) { c->n=0; c->z=0; c->c=1; c->v=1; } ";
+                s += "else { c->n = (_a < _b); c->z = (_a == _b); "
+                     "c->c = (_a >= _b); c->v = 0; } ";
+                s += "(void)_r; } ";
+                s += "else { c->n=" + std::to_string((nzcv >> 3) & 1) + "; ";
+                s += "c->z=" + std::to_string((nzcv >> 2) & 1) + "; ";
+                s += "c->c=" + std::to_string((nzcv >> 1) & 1) + "; ";
+                s += "c->v=" + std::to_string(nzcv & 1) + "; } }";
+                put(s);
+                return true;
+            }
+
             // FCMP / FCMPE, including the compare-against-zero forms. The
             // low five bits are opcode2: bit 3 selects the #0.0 variant (Rm is
             // then not a register at all) and bit 4 selects the signalling
@@ -1551,6 +1570,38 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 put(s);
                 return true;
             }
+            // ABS / NEG, lanewise over integer elements. U picks NEG.
+            if (opcode == 0x0B) {
+                const u32 size = (i >> 22) & 3;
+                const int esz = 1 << size;
+                const int bytes = scl_misc ? 8 : (Q ? 16 : 8);
+                // The 64-bit element only exists as 2D or as the scalar form.
+                const bool shaped = scl_misc ? (size == 3) : !(size == 3 && !Q);
+                if (shaped) {
+                    const int lanes = bytes / esz;
+                    const std::string uty = "uint" + std::to_string(esz * 8) + "_t";
+                    const std::string ity = "int" + std::to_string(esz * 8) + "_t";
+                    std::string s = "{ " + uty + " _a[" + std::to_string(lanes) + "],_r[" +
+                                    std::to_string(lanes) + "]; ";
+                    s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," +
+                         std::to_string(bytes) + "); ";
+                    // Unsigned throughout: negating the minimum signed value wraps
+                    // on the architecture and is undefined on a signed C type.
+                    if (U) {
+                        s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=(" +
+                             uty + ")(0-_a[_i]); ";
+                    } else {
+                        s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=((" +
+                             ity + ")_a[_i]<0) ? (" + uty + ")(0-_a[_i]) : _a[_i]; ";
+                    }
+                    s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" +
+                         std::to_string(rd) + "][1]=0; ";
+                    s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," +
+                         std::to_string(bytes) + "); }";
+                    put(s);
+                    return true;
+                }
+            }
             if (cmp) {
                 const char* ct = dbl ? "double" : "float";
                 const int fsz = dbl ? 8 : 4;
@@ -1578,8 +1629,13 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
     // bits would silently address the wrong register.
     {
         // Bit 29 (U) selects FMULX, a different operation - keep it out of FMUL.
-        const bool vec_idx = (i & 0xBF00F400) == 0x0F009000;
-        const bool scl_idx = (i & 0xFF00F400) == 0x5F009000;
+        // Opcode 1001 is FMUL, 0001 FMLA, 0101 FMLS; the three share everything
+        // except whether the product replaces the destination or accumulates
+        // into it.
+        const u32 idxop = (i >> 12) & 0xF;
+        const bool idx_shape = (idxop == 0x9 || idxop == 0x1 || idxop == 0x5);
+        const bool vec_idx = idx_shape && (i & 0xBF000400) == 0x0F000000;
+        const bool scl_idx = idx_shape && (i & 0xFF000400) == 0x5F000000;
         if ((vec_idx || scl_idx) && ((i >> 23) & 1) == 1) {
             const u32 Q = (i >> 30) & 1;
             const bool dbl = ((i >> 22) & 1) != 0;
@@ -1597,7 +1653,15 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
                 s += "memcpy(&_m,(const uint8_t*)c->vreg[" + std::to_string(rm) + "]+" +
                      std::to_string(index * fsz) + "," + std::to_string(fsz) + "); ";
-                s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=_a[_i]*_m; ";
+                if (idxop == 0x9) {
+                    s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=_a[_i]*_m; ";
+                } else {
+                    // FMLA/FMLS read the destination before writing it.
+                    s += "memcpy(_r,c->vreg[" + std::to_string(rd) + "]," +
+                         std::to_string(bytes) + "); ";
+                    s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]" +
+                         std::string(idxop == 0x1 ? "+=" : "-=") + "_a[_i]*_m; ";
+                }
                 s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
                      "][1]=0; ";
                 s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
