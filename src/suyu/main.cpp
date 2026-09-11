@@ -5078,6 +5078,19 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                 last_emu_speed_.load(std::memory_order_relaxed);
             state[QStringLiteral("shaders_building")] =
                 (emulation_running && system) ? system->GPU().ShaderNotify().ShadersBuilding() : 0;
+            // TAS playback progress. A replayed script is a fixed workload, so
+            // the honest CPU benchmark is how long a backend takes to reach the
+            // last frame - comparing FPS at equal wall-clock compares two runs
+            // that are at different points in the script.
+            if (input_subsystem) {
+                const auto [tas_state, tas_frame, tas_lengths] =
+                    input_subsystem->GetTas()->GetStatus();
+                state[QStringLiteral("tas_running")] =
+                    tas_state == InputCommon::TasInput::TasState::Running;
+                state[QStringLiteral("tas_frame")] = static_cast<qint64>(tas_frame);
+                state[QStringLiteral("tas_total_frames")] =
+                    static_cast<qint64>(tas_lengths[0]);
+            }
             state[QStringLiteral("qt_ssl_available")] = qt_ssl_available_;
             state[QStringLiteral("qt_ssl_build_version")] = qt_ssl_build_version_;
             state[QStringLiteral("qt_ssl_runtime_version")] = qt_ssl_runtime_version_;
