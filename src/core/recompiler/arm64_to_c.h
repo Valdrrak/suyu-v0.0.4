@@ -16,6 +16,7 @@
 #include <iomanip>
 #include <utility>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -1078,6 +1079,11 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         const u32 sf = i >> 31, ftype = (i >> 22) & 3;
         const u32 rmode = (i >> 19) & 3, opcode = (i >> 16) & 7;
         const u32 fbits = 64 - ((i >> 10) & 0x3F);
+        // fbits is fixed at translation time, so the scale is a literal rather
+        // than a call into libm. 2^n is exact in binary floating point for every
+        // n this encoding can name, so "%.1f" round-trips it without loss.
+        char scale_lit[64];
+        snprintf(scale_lit, sizeof scale_lit, "%.1f", std::pow(2.0, (double)fbits));
         const u32 rn = (i >> 5) & 31, rd = i & 31;
         // A 32-bit destination only encodes scales that leave fbits in 1..32.
         const bool shaped = (ftype == 0 || ftype == 1) && fbits >= 1 && (sf || fbits <= 32);
@@ -1085,8 +1091,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             const bool dbl = (ftype == 1);
             const char* ct = dbl ? "double" : "float";
             const int fsz = dbl ? 8 : 4;
-            const std::string fb = std::to_string(fbits);
-            if (rmode == 3 && (opcode == 0 || opcode == 1) && rd != 31) {
+                if (rmode == 3 && (opcode == 0 || opcode == 1) && rd != 31) {
                 const bool is_signed = (opcode == 0);
                 const char* it = sf ? (is_signed ? "int64_t" : "uint64_t")
                                     : (is_signed ? "int32_t" : "uint32_t");
@@ -1102,7 +1107,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                                         : (is_signed ? "0x7FFFFFFFULL" : "0xFFFFFFFFULL");
                 std::string s = "{ " + std::string(ct) + " _a; memcpy(&_a,&c->vreg[" +
                                 std::to_string(rn) + "][0]," + std::to_string(fsz) + "); ";
-                s += std::string("_a = ") + (dbl ? "ldexp" : "ldexpf") + "(_a," + fb + "); ";
+                s += std::string("_a = _a * (") + ct + ")" + scale_lit + "; ";
                 s += "uint64_t _r; if (_a != _a) _r = 0ULL; ";
                 s += std::string("else if (!(_a > (") + ct + ")" + lo_bound + ")) _r = " + sat_lo + "; ";
                 s += std::string("else if (!(_a < (") + ct + ")" + hi_bound + ")) _r = " + sat_hi + "; ";
@@ -1118,7 +1123,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                                            : (opcode == 2 ? "(int32_t)" + Xz(rn)
                                                           : "(uint32_t)" + Xz(rn));
                 std::string s = "{ double _t = (double)(" + src + "); ";
-                s += "" + std::string(ct) + " _r = (" + ct + ")ldexp(_t,-" + fb + "); ";
+                s += std::string(ct) + " _r = (" + ct + ")(_t / " + scale_lit + "); ";
                 s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
                      "][1]=0; ";
                 s += "memcpy(&c->vreg[" + std::to_string(rd) + "][0],&_r," +
