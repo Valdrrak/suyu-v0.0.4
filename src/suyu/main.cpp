@@ -5073,6 +5073,10 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
             // GetAndResetPerfStats here, which would reset the counters and
             // corrupt the status bar's own reading.
             state[QStringLiteral("fps")] = last_game_fps_.load(std::memory_order_relaxed);
+            // system_fps counts VBlanks, average_game_fps counts GPU frame
+            // renders; a run can present steadily while rendering fewer frames,
+            // so reporting only one of them hides half the picture.
+            state[QStringLiteral("vps")] = last_system_fps_.load(std::memory_order_relaxed);
             state[QStringLiteral("frame_ms")] = last_frame_ms_.load(std::memory_order_relaxed);
             state[QStringLiteral("emulation_speed")] =
                 last_emu_speed_.load(std::memory_order_relaxed);
@@ -7128,6 +7132,7 @@ void GMainWindow::UpdateStatusBar() {
 
     auto results = system->GetAndResetPerfStats();
     last_game_fps_.store(results.average_game_fps, std::memory_order_relaxed);
+    last_system_fps_.store(results.system_fps, std::memory_order_relaxed);
     last_frame_ms_.store(results.frametime * 1000.0, std::memory_order_relaxed);
     last_emu_speed_.store(results.emulation_speed, std::memory_order_relaxed);
     auto& shader_notify = system->GPU().ShaderNotify();

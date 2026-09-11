@@ -1005,6 +1005,130 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         }
     }
 
+    // USHL / SSHL: shift each lane by the signed low byte of the corresponding
+    // lane of Rm - positive shifts left, negative shifts right. Bits 15..11 are
+    // pinned because UQSHL (01001) and URSHL (01010) sit immediately next to
+    // this encoding and saturate or round instead.
+    if ((i & 0x9F20FC00) == 0x0E204400) {
+        const u32 Q = (i >> 30) & 1, U = (i >> 29) & 1;
+        const u32 size = (i >> 22) & 3;
+        const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
+        const int esz = 1 << size;
+        const int ebits = esz * 8;
+        const int bytes = Q ? 16 : 8;
+        // The 64-bit element only exists as 2D; 1D is the scalar encoding.
+        if (!(size == 3 && !Q)) {
+            const int lanes = bytes / esz;
+            const std::string uty = "uint" + std::to_string(ebits) + "_t";
+            const std::string ity = "int" + std::to_string(ebits) + "_t";
+            const std::string eb = std::to_string(ebits);
+            std::string s = "{ " + uty + " _a[" + std::to_string(lanes) + "],_m[" +
+                            std::to_string(lanes) + "],_r[" + std::to_string(lanes) + "]; ";
+            s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
+            s += "memcpy(_m,c->vreg[" + std::to_string(rm) + "]," + std::to_string(bytes) + "); ";
+            s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++){ ";
+            s += "int _s=(int)(int8_t)(_m[_i]&0xFF); ";
+            // A shift of the element width or more is defined by the
+            // architecture but undefined in C, so both ends are special-cased.
+            s += "if(_s>=0) _r[_i]=(_s>=" + eb + ")?(" + uty + ")0:(" + uty + ")((" + uty +
+                 ")_a[_i]<<_s); ";
+            s += "else { int _t=-_s; ";
+            if (U) {
+                s += "_r[_i]=(_t>=" + eb + ")?(" + uty + ")0:(" + uty + ")(_a[_i]>>_t); ";
+            } else {
+                s += "_r[_i]=(" + uty + ")((" + ity + ")_a[_i]>>((_t>=" + eb + ")?(" + eb +
+                     "-1):_t)); ";
+            }
+            s += "} } ";
+            s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
+                 "][1]=0; ";
+            s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
+            put(s);
+            return true;
+        }
+    }
+
+    // LD1R: load one element and replicate it across every lane. Bit 21 is R,
+    // which selects LD2R/LD4R - those write a second register and must stay on
+    // the fallback, so it has to be in the mask.
+    if ((i & 0xBFFFF000) == 0x0D40C000) {
+        const u32 Q = (i >> 30) & 1;
+        const u32 size = (i >> 10) & 3;
+        const u32 rn = (i >> 5) & 31, rt = i & 31;
+        const int esz = 1 << size;
+        const int bytes = Q ? 16 : 8;
+        const int lanes = bytes / esz;
+        const std::string uty = "uint" + std::to_string(esz * 8) + "_t";
+        std::string s = "{ " + uty + " _e = (" + uty + ")recomp_load" +
+                        std::to_string(esz * 8) + "(c," + Xsp(rn) + "); ";
+        s += uty + " _r[" + std::to_string(lanes) + "]; ";
+        s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=_e; ";
+        s += "c->vreg[" + std::to_string(rt) + "][0]=0; c->vreg[" + std::to_string(rt) +
+             "][1]=0; ";
+        s += "memcpy(c->vreg[" + std::to_string(rt) + "],_r," + std::to_string(bytes) + "); }";
+        put(s);
+        return true;
+    }
+
+    // FP <-> fixed-point conversions: the same shape as the integer forms
+    // below but with bit 21 clear and a scale field. fbits is 64 - scale, and
+    // the value is shifted by 2^fbits around the conversion. ldexp does that
+    // exactly; multiplying by a built-up power of two does not.
+    if ((i & 0x5F200000) == 0x1E000000 && ((i >> 21) & 1) == 0) {
+        const u32 sf = i >> 31, ftype = (i >> 22) & 3;
+        const u32 rmode = (i >> 19) & 3, opcode = (i >> 16) & 7;
+        const u32 fbits = 64 - ((i >> 10) & 0x3F);
+        const u32 rn = (i >> 5) & 31, rd = i & 31;
+        // A 32-bit destination only encodes scales that leave fbits in 1..32.
+        const bool shaped = (ftype == 0 || ftype == 1) && fbits >= 1 && (sf || fbits <= 32);
+        if (shaped) {
+            const bool dbl = (ftype == 1);
+            const char* ct = dbl ? "double" : "float";
+            const int fsz = dbl ? 8 : 4;
+            const std::string fb = std::to_string(fbits);
+            if (rmode == 3 && (opcode == 0 || opcode == 1) && rd != 31) {
+                const bool is_signed = (opcode == 0);
+                const char* it = sf ? (is_signed ? "int64_t" : "uint64_t")
+                                    : (is_signed ? "int32_t" : "uint32_t");
+                const char* lo_bound = sf ? (is_signed ? "-9223372036854775808.0" : "0.0")
+                                          : (is_signed ? "-2147483648.0" : "0.0");
+                const char* hi_bound = sf ? (is_signed ? "9223372036854775807.0"
+                                                       : "18446744073709551615.0")
+                                          : (is_signed ? "2147483647.0" : "4294967295.0");
+                const char* sat_lo = sf ? (is_signed ? "0x8000000000000000ULL" : "0ULL")
+                                        : (is_signed ? "0xFFFFFFFF80000000ULL" : "0ULL");
+                const char* sat_hi = sf ? (is_signed ? "0x7FFFFFFFFFFFFFFFULL"
+                                                     : "0xFFFFFFFFFFFFFFFFULL")
+                                        : (is_signed ? "0x7FFFFFFFULL" : "0xFFFFFFFFULL");
+                std::string s = "{ " + std::string(ct) + " _a; memcpy(&_a,&c->vreg[" +
+                                std::to_string(rn) + "][0]," + std::to_string(fsz) + "); ";
+                s += std::string("_a = ") + (dbl ? "ldexp" : "ldexpf") + "(_a," + fb + "); ";
+                s += "uint64_t _r; if (_a != _a) _r = 0ULL; ";
+                s += std::string("else if (!(_a > (") + ct + ")" + lo_bound + ")) _r = " + sat_lo + "; ";
+                s += std::string("else if (!(_a < (") + ct + ")" + hi_bound + ")) _r = " + sat_hi + "; ";
+                s += "else _r = (uint64_t)(" + std::string(it) + ")_a; ";
+                if (!sf) s += "_r &= 0xFFFFFFFFULL; ";
+                s += "c->x[" + std::to_string(rd) + "] = _r; }";
+                put(s);
+                return true;
+            }
+            if (rmode == 0 && (opcode == 2 || opcode == 3)) {
+                const std::string src = sf ? (opcode == 2 ? "(int64_t)" + Xz(rn)
+                                                          : "(uint64_t)" + Xz(rn))
+                                           : (opcode == 2 ? "(int32_t)" + Xz(rn)
+                                                          : "(uint32_t)" + Xz(rn));
+                std::string s = "{ double _t = (double)(" + src + "); ";
+                s += "" + std::string(ct) + " _r = (" + ct + ")ldexp(_t,-" + fb + "); ";
+                s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
+                     "][1]=0; ";
+                s += "memcpy(&c->vreg[" + std::to_string(rd) + "][0],&_r," +
+                     std::to_string(fsz) + "); }";
+                put(s);
+                return true;
+            }
+        }
+    }
+
     // FP <-> integer conversions and FMOV between register files. These share
     // bit 21 with the FP arithmetic forms and are distinguished by bits 15..10
     // being zero, so they must be decoded ahead of the arithmetic/compare block
