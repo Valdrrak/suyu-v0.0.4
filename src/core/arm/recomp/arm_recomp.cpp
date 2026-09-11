@@ -266,11 +266,11 @@ std::string FormatRecompCoverage() {
         // What the guest actually asks the kernel for. A boot that stops making
         // system calls while still executing millions of blocks is spinning on
         // something, and this says on what.
-        o += "  --- SVCs by call count ---\n";
+        o += "  --- SVCs by call count ---\n";
         for (const auto& [num, count] : TopN(g_counters.svc_numbers, 16)) {
-            o += fmt::format("    svc 0x{:02X}  {:>10}\n", num, count);
+            o += fmt::format("    svc 0x{:02X}  {:>10}\n", num, count);
         }
-        o += fmt::format("    {} distinct SVCs\n", g_counters.svc_numbers.size());
+        o += fmt::format("    {} distinct SVCs\n", g_counters.svc_numbers.size());
     }
 
     if (!g_counters.miss_pc.empty()) {
