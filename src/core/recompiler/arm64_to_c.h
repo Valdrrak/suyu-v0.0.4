@@ -1075,7 +1075,15 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
     // below but with bit 21 clear and a scale field. fbits is 64 - scale, and
     // the value is shifted by 2^fbits around the conversion. ldexp does that
     // exactly; multiplying by a built-up power of two does not.
-    if ((i & 0x5F200000) == 0x1E000000 && ((i >> 21) & 1) == 0) {
+    // Off deliberately, and measured: enabling this costs 25.0s against 20.7s on
+    // the reference replay. Translating one instruction pulls its whole block out
+    // of the JIT and into generated C, and these sit in float-heavy blocks the JIT
+    // compiles well - a NaN test, two bound compares and a cast cannot beat the
+    // single native instruction it replaces. Coverage only pays when the emitted C
+    // is faster than the JIT for that block. Re-measure before flipping this.
+    constexpr bool kTranslateFixedPointConversions = false;
+    if (kTranslateFixedPointConversions &&
+        (i & 0x5F200000) == 0x1E000000 && ((i >> 21) & 1) == 0) {
         const u32 sf = i >> 31, ftype = (i >> 22) & 3;
         const u32 rmode = (i >> 19) & 3, opcode = (i >> 16) & 7;
         const u32 fbits = 64 - ((i >> 10) & 0x3F);
