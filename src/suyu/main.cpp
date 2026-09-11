@@ -5,6 +5,7 @@
 #include <clocale>
 #include <cmath>
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdio>
 #include <exception>
@@ -6237,6 +6238,33 @@ namespace {
     };
 std::vector<QLibrary*> loaded_images;
 std::vector<RecompImage> loaded_records;
+
+// A compact, sorted view of the records above. The dispatcher runs tens of
+// millions of times a second, and a RecompImage is ~56 bytes with a std::string
+// at the front, so walking the records themselves touches a cache line per
+// image. These entries are 24 bytes and contiguous.
+struct OwnerEntry {
+    u64 base;
+    Core::RecompLookupFn lookup;
+    int record;
+};
+std::array<OwnerEntry, 16> owner_entries{};
+int owner_count = 0;
+
+void RebuildOwnerTable() {
+    int n = 0;
+    for (size_t k = 0; k < loaded_records.size() && n < static_cast<int>(owner_entries.size());
+         ++k) {
+        const auto& r = loaded_records[k];
+        if (r.base == 0 || !r.lookup) {
+            continue;
+        }
+        owner_entries[n++] = OwnerEntry{r.base, r.lookup, static_cast<int>(k)};
+    }
+    std::sort(owner_entries.begin(), owner_entries.begin() + n,
+              [](const OwnerEntry& a, const OwnerEntry& b) { return a.base < b.base; });
+    owner_count = n;
+}
 } // Anonymous namespace
 
 void GMainWindow::UnloadRecompiledImages() {
@@ -6247,6 +6275,7 @@ void GMainWindow::UnloadRecompiledImages() {
     }
     loaded_images.clear();
     loaded_records.clear();
+    owner_count = 0;
 }
 
 bool GMainWindow::RecompiledImagesLoaded() const {
@@ -6414,6 +6443,7 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir) {
         if (record && record->set_base) {
             record->base = base;
             record->set_base(base);
+            RebuildOwnerTable();
             LOG_INFO(Frontend, "Recompiled image for module '{}' (#{}) based at {:#x}", name,
                      index, base);
         } else {
@@ -6442,34 +6472,36 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir) {
         // bounds-checked against its own address range) and the full scan below
         // runs anyway, so the worst case is one wasted call. That is what makes
         // this safe to share across threads where a (pc, fn) cache was not.
-        static int last_owner_hint = -1;
-        {
-            const int hint = last_owner_hint;
-            if (hint >= 0 && static_cast<size_t>(hint) < loaded_records.size()) {
-                auto& record = loaded_records[hint];
-                if (record.base != 0 && record.base <= pc) {
-                    if (auto* block = record.lookup(pc)) {
-                        return block;
-                    }
-                }
+        // Per-thread, not shared. The CPU threads are usually in different
+        // modules, so a single shared hint has them overwriting each other's and
+        // the fast path misses for everyone.
+        thread_local int hint = -1;
+        const int n = owner_count;
+        if (hint >= 0 && hint < n && owner_entries[hint].base <= pc) {
+            if (auto* block = owner_entries[hint].lookup(pc)) {
+                return block;
             }
         }
 
-        RecompImage* owner = nullptr;
-        for (auto& record : loaded_records) {
-            if (record.base != 0 && record.base <= pc &&
-                (!owner || record.base > owner->base)) {
-                owner = &record;
+        // Entries are sorted by base, so the owner is the last one at or below
+        // pc and the scan can stop at the first entry above it.
+        int owner_slot = -1;
+        for (int k = 0; k < n; ++k) {
+            if (owner_entries[k].base > pc) {
+                break;
             }
+            owner_slot = k;
         }
+        RecompImage* owner =
+            owner_slot >= 0 ? &loaded_records[owner_entries[owner_slot].record] : nullptr;
         if (owner) {
             // Absolute PC, not owner-relative: recomp_image_lookup subtracts
             // g_module_base itself (arm64_to_c.h:2316). Passing an already
             // relative PC subtracted the base twice, underflowed, and missed
             // every single time - which is why the AOT path executed zero
             // blocks and silently ran everything on the JIT instead.
-            if (auto* block = owner->lookup(pc)) {
-                last_owner_hint = static_cast<int>(owner - loaded_records.data());
+            if (auto* block = owner_entries[owner_slot].lookup(pc)) {
+                hint = owner_slot;
                 return block;
             }
             // An owner was found and simply had no block at that offset. That is
