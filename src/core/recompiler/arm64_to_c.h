@@ -1035,8 +1035,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             // FCVT{N,P,M,Z}{S,U} and FCVTA{S,U}: FP register -> integer register.
             // rmode names the rounding mode; FCVTA{S,U} is the odd one out,
             // encoded as opcode 4/5 with rmode 0 and rounding halfway cases away
-            // from zero. Only the round-toward-zero form used to be handled, and
-            // fcvtms alone was half of every fallback transition in the target title.
+            // from zero.
             const bool cvt_away = (rmode == 0 && (opcode == 4 || opcode == 5));
             if ((opcode == 0 || opcode == 1 || cvt_away) && rd != 31) {
                 const bool is_signed = cvt_away ? (opcode == 4) : (opcode == 0);
@@ -1055,8 +1054,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                                     : (is_signed ? "int32_t" : "uint32_t");
                 std::string s = "{ " + std::string(ct) + " _a; memcpy(&_a,&c->vreg[" +
                                 std::to_string(rn) + "][0]," + std::to_string(fsz) + "); ";
-                // Round before saturating, which is the order the architecture
-                // specifies, so the bounds below compare an already-integral value.
+                // Round before saturating, the order the architecture specifies.
                 if (rnd) s += std::string("_a = ") + rnd + "(_a); ";
                 // FCVTZS/FCVTZU saturate: NaN gives 0, and anything outside the
                 // destination's range clamps to that range's min or max. A bare
