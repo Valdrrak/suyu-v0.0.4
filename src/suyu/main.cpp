@@ -6234,6 +6234,9 @@ namespace {
         std::string name;
         Core::RecompLookupFn lookup;
         void (*set_base)(u64);
+        // Hands out the image's block index so the dispatcher can do the lookup
+        // itself instead of calling across the shared-object boundary for it.
+        int (*get_index)(u64*, u64*, Core::RecompBlockFn**);
         u64 base = 0;
     };
 std::vector<QLibrary*> loaded_images;
@@ -6246,6 +6249,12 @@ std::vector<RecompImage> loaded_records;
 struct OwnerEntry {
     u64 base;
     Core::RecompLookupFn lookup;
+    // A direct view of the image's block index. Hitting it is a bounds check and
+    // one load; missing it falls back to `lookup`, which also covers addresses
+    // outside the indexed range.
+    u64 idx_lo;
+    u64 idx_hi;
+    Core::RecompBlockFn* idx;
     int record;
 };
 std::array<OwnerEntry, 16> owner_entries{};
@@ -6259,7 +6268,14 @@ void RebuildOwnerTable() {
         if (r.base == 0 || !r.lookup) {
             continue;
         }
-        owner_entries[n++] = OwnerEntry{r.base, r.lookup, static_cast<int>(k)};
+        u64 lo = 0, hi = 0;
+        Core::RecompBlockFn* idx = nullptr;
+        if (!r.get_index || !r.get_index(&lo, &hi, &idx)) {
+            lo = 1;   // An empty range no pc can satisfy.
+            hi = 0;
+            idx = nullptr;
+        }
+        owner_entries[n++] = OwnerEntry{r.base, r.lookup, lo, hi, idx, static_cast<int>(k)};
     }
     std::sort(owner_entries.begin(), owner_entries.begin() + n,
               [](const OwnerEntry& a, const OwnerEntry& b) { return a.base < b.base; });
@@ -6372,7 +6388,10 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir) {
         }
         auto* set_base =
             reinterpret_cast<void (*)(u64)>(lib->resolve("recomp_image_set_base"));
-        records.push_back(RecompImage{owner.dirName().toStdString(), fn, set_base, 0});
+        auto* get_index = reinterpret_cast<int (*)(u64*, u64*, Core::RecompBlockFn**)>(
+            lib->resolve("recomp_image_index"));
+        records.push_back(
+            RecompImage{owner.dirName().toStdString(), fn, set_base, get_index, 0});
     }
 
     if (found.empty()) {
@@ -6478,7 +6497,15 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir) {
         thread_local int hint = -1;
         const int n = owner_count;
         if (hint >= 0 && hint < n && owner_entries[hint].base <= pc) {
-            if (auto* block = owner_entries[hint].lookup(pc)) {
+            const auto& e = owner_entries[hint];
+            if (pc >= e.idx_lo && pc <= e.idx_hi) {
+                // The index covers every 4-byte slot in the module's range and
+                // holds null where no block starts, so a null here means the
+                // same thing the call would have returned.
+                if (auto* block = e.idx[(pc - e.idx_lo) >> 2]) {
+                    return block;
+                }
+            } else if (auto* block = e.lookup(pc)) {
                 return block;
             }
         }
@@ -6500,7 +6527,14 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir) {
             // relative PC subtracted the base twice, underflowed, and missed
             // every single time - which is why the AOT path executed zero
             // blocks and silently ran everything on the JIT instead.
-            if (auto* block = owner_entries[owner_slot].lookup(pc)) {
+            const auto& e = owner_entries[owner_slot];
+            Core::RecompBlockFn block = nullptr;
+            if (pc >= e.idx_lo && pc <= e.idx_hi) {
+                block = e.idx[(pc - e.idx_lo) >> 2];
+            } else {
+                block = e.lookup(pc);
+            }
+            if (block) {
                 hint = owner_slot;
                 return block;
             }

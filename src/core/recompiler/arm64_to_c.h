@@ -2803,6 +2803,16 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
           "   module before any guest thread exists - so the build below is not\n"
           "   racing anything. */\n"
           "void recomp_build_index(void){ _build_idx(); }\n"
+          "/* Module-relative view of the block index, for the host dispatcher.\n"
+          "   The index itself is static to this unit, so the exported wrapper in\n"
+          "   recomp_export.c has to come through here. */\n"
+          "int _recomp_index_view(uint64_t* lo, uint64_t* hi, BlockFn** idx){\n"
+          "  _build_idx();\n"
+          "  if(!_idx) return 0;\n"
+          "  *lo = _idx_lo; *hi = _idx_hi; *idx = _idx;\n"
+          "  return 1;\n"
+          "}\n"
+          "\n"
           "BlockFn recomp_lookup(uint64_t pc){\n"
           "  if(_idx && pc>=_idx_lo && pc<=_idx_hi) return _idx[(size_t)((pc-_idx_lo)>>2)];\n"
           "  {\n"
@@ -3048,6 +3058,19 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
           "#define RECOMP_API __attribute__((visibility(\"default\")))\n"
           "#endif\n\n"
           "RECOMP_API BlockFn recomp_image_lookup(uint64_t pc){ return recomp_lookup(pc - g_module_base); }\n\n"
+          /* Hands the block index out so a host dispatcher can do the lookup
+             itself. Going through recomp_image_lookup costs three nested calls
+             across the shared-object boundary on every block edge; with this it
+             is a bounds check and one load. Addresses are absolute so the caller
+             needs to know nothing about the module base. Only valid once
+             recomp_image_set_base has run, which is when the index is built. */
+          "extern int _recomp_index_view(uint64_t*, uint64_t*, BlockFn**);\n"
+          "RECOMP_API int recomp_image_index(uint64_t* lo, uint64_t* hi, BlockFn** idx){\n"
+          "  if(!_recomp_index_view(lo, hi, idx)) return 0;\n"
+          "  *lo += g_module_base; *hi += g_module_base;\n"
+          "  return 1;\n"
+          "}\n"
+          "\n"
           "/* Tells this image where its module actually got loaded, so the\n"
           "   addresses it computes are real rather than module-relative. */\n"
           "RECOMP_API void recomp_image_set_base(uint64_t base){ g_module_base = base;\n"
