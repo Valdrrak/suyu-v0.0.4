@@ -269,6 +269,11 @@ inline size_t FuncNameTo(char (&b)[64], const char* mod, u64 v) {
 // Set by the emit loop so a direct branch whose target is a known block start
 // can call that block instead of returning to the dispatcher. Null while the
 // decode tests run, which is what keeps their expected output stable.
+// Emits "carry on at t": a direct call when t is a block we emitted, otherwise
+// the original park-the-PC-and-return. Loop back edges are conditional, so the
+// conditional forms need this as much as the unconditional ones do.
+inline std::string ChainTo(u64 t);
+
 inline const std::unordered_set<u64>* g_chain_blocks = nullptr;
 inline const char* g_chain_mod = nullptr;
 
@@ -277,6 +282,32 @@ inline const char* g_chain_mod = nullptr;
 // unbounded chain would let a guest loop run uninterruptibly; it also derives
 // the executed-block count from how much of this budget was spent.
 inline constexpr int kChainBudget = 256;
+
+// Conditional branches deliberately do not chain. Measured: chaining them too
+// takes 2.00 ms/frame against 1.80, and turns a tight distribution into one
+// spanning 1.70-2.54 across six reps while the dynarmic arm stays at 2.905 in
+// the same runs. It also pushed JIT transitions from 69,008 to 88,983 and more
+// than doubled lookup misses, which is unexplained and worth understanding
+// before trying this again.
+inline std::string ChainTo(u64 t) {
+    char b[256];
+    if (g_chain_blocks && g_chain_mod && g_chain_blocks->count(t)) {
+        char nm[64];
+        FuncNameTo(nm, g_chain_mod, t);
+        // The declaration is at block scope so a unit needs no list of the
+        // blocks it reaches. `return f(c)` is written as a tail call, though
+        // nothing may come of that below -O2 - which is why the budget has to
+        // bound the depth rather than assume it stays at one frame.
+        snprintf(b, sizeof b,
+                 "{ void %s(GuestContext*); if (--c->chain_budget <= 0) "
+                 "{ c->pc=g_module_base+0x%llxULL; return; } return %s(c); }",
+                 nm, (unsigned long long)t, nm);
+    } else {
+        snprintf(b, sizeof b, "{ c->pc=g_module_base+0x%llxULL; return; }",
+                 (unsigned long long)t);
+    }
+    return b;
+}
 
 inline std::string Xz(u32 r) {
     return r == 31 ? std::string("(uint64_t)0") : ("c->x[" + std::to_string(r) + "]");
@@ -552,17 +583,8 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         // keeps the chain from growing the stack. Falling out of budget parks
         // the PC and returns exactly as before, so the dispatcher stays the only
         // thing that decides what runs when a chain ends.
-        if (g_chain_blocks && g_chain_mod && g_chain_blocks->count(t)) {
-            char nm[64];
-            FuncNameTo(nm, g_chain_mod, t);
-            snprintf(buf, sizeof buf,
-                     "{ void %s(GuestContext*); if (--c->chain_budget <= 0) "
-                     "{ c->pc=g_module_base+0x%llxULL; return; } return %s(c); }",
-                     nm, (unsigned long long)t, nm);
-            put(buf);
-            return false;
-        }
-        snprintf(buf, sizeof buf, "c->pc=g_module_base+0x%llxULL; return;", (unsigned long long)t); put(buf); return false;
+        put(ChainTo(t));
+        return false;
     }
     if ((i & 0xFFFFFC1F) == 0xD65F0000) { put("c->pc=c->x[30]; return; /* RET */"); return false; }
     if ((i & 0xFFFFFC1F) == 0xD61F0000) { u32 rn = (i >> 5) & 31; snprintf(buf, sizeof buf, "c->pc=c->x[%u]; return; /* BR */", rn); put(buf); return false; }
