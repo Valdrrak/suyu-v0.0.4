@@ -56,9 +56,25 @@ Upstream was inconsistent about its own version — the repository is named
 to `v0.04`. This fork normalises to the three-part form. Read literally, `v0.04`
 means 0.4, which was evidently not the intent.
 
-Platforms: Windows, Linux, Android. macOS/iOS not included. Only the Windows
-build is exercised regularly here; the others are inherited from upstream and
-untested since the fork.
+Platforms: Windows and Linux both build and run. Android is inherited from
+upstream and untested since the fork; macOS/iOS are not included.
+
+Linux needs five things Windows does not, all handled by
+[`scripts/build-suyu.sh`][bld] in the consuming project:
+
+- CMake 3.31 (`CMakeModules/CPMUtil.cmake` requires it; Ubuntu 24.04 ships 3.28)
+- `-Dfmt_FORCE_BUNDLED=ON` — the system fmt 9 has no `format_string::get()`, and
+  suyu only forces the bundled one inside a branch that does not apply here
+- Qt6 Charts, which Ubuntu packages separately
+- system Boost
+- skipping the `externals/ownfoil` submodule, whose own nested submodule no
+  longer resolves; nothing in suyu's CMake references it
+
+Building on Linux found two defects that MSVC had silently accepted: literal
+carriage returns inside string literals, and a boost forwarding header that
+resolved only where CPM had fetched boost.
+
+[bld]: https://github.com/dougchansan/mk8-recomp/blob/main/scripts/build-suyu.sh
 
 ## Changes in v0.0.5
 
