@@ -1032,12 +1032,32 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 return true;
             }
 
-            // FCVTZS / FCVTZU: FP register -> integer register, round toward zero.
-            if (rmode == 3 && (opcode == 0 || opcode == 1) && rd != 31) {
-                const char* it = sf ? (opcode == 0 ? "int64_t" : "uint64_t")
-                                    : (opcode == 0 ? "int32_t" : "uint32_t");
+            // FCVT{N,P,M,Z}{S,U} and FCVTA{S,U}: FP register -> integer register.
+            // rmode names the rounding mode; FCVTA{S,U} is the odd one out,
+            // encoded as opcode 4/5 with rmode 0 and rounding halfway cases away
+            // from zero. Only the round-toward-zero form used to be handled, and
+            // fcvtms alone was half of every fallback transition in the target title.
+            const bool cvt_away = (rmode == 0 && (opcode == 4 || opcode == 5));
+            if ((opcode == 0 || opcode == 1 || cvt_away) && rd != 31) {
+                const bool is_signed = cvt_away ? (opcode == 4) : (opcode == 0);
+                const char* rnd = nullptr;
+                if (cvt_away) {
+                    rnd = dbl ? "round" : "roundf";
+                } else if (rmode == 0) {
+                    rnd = dbl ? "nearbyint" : "nearbyintf";
+                } else if (rmode == 1) {
+                    rnd = dbl ? "ceil" : "ceilf";
+                } else if (rmode == 2) {
+                    rnd = dbl ? "floor" : "floorf";
+                }
+                // rmode 3 needs no call: the cast below already truncates.
+                const char* it = sf ? (is_signed ? "int64_t" : "uint64_t")
+                                    : (is_signed ? "int32_t" : "uint32_t");
                 std::string s = "{ " + std::string(ct) + " _a; memcpy(&_a,&c->vreg[" +
                                 std::to_string(rn) + "][0]," + std::to_string(fsz) + "); ";
+                // Round before saturating, which is the order the architecture
+                // specifies, so the bounds below compare an already-integral value.
+                if (rnd) s += std::string("_a = ") + rnd + "(_a); ";
                 // FCVTZS/FCVTZU saturate: NaN gives 0, and anything outside the
                 // destination's range clamps to that range's min or max. A bare
                 // C cast is undefined for exactly those inputs, and on x86 it
@@ -1046,7 +1066,6 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 // game code converts out-of-range values constantly - clamped
                 // indices, hashes, fixed-point - so the wrong answer here is a
                 // steady drip of corruption rather than an immediate fault.
-                const bool is_signed = (opcode == 0);
                 const char* lo_bound = sf ? (is_signed ? "-9223372036854775808.0" : "0.0")
                                           : (is_signed ? "-2147483648.0" : "0.0");
                 const char* hi_bound = sf ? (is_signed ? "9223372036854775807.0"
