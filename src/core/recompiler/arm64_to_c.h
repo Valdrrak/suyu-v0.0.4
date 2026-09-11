@@ -1049,6 +1049,92 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         }
     }
 
+    // SHL by immediate. Bit 29 is U and must stay in the mask: the same opcode
+    // with U set is UQSHL, which saturates. immh selects the element width and
+    // immh:immb encodes the shift as a bias above it.
+    // Off deliberately, and measured. Enabling this frees the hot block that also
+    // contains MOVI - transitions drop 47% - and costs 2.13 ms/frame against
+    // 1.95. The block is SIMD-heavy and the JIT compiles it better than the
+    // emitted C does, so paying the transition to stay in the JIT is cheaper
+    // than owning the block. Re-measure before flipping this.
+    constexpr bool kTranslateShiftLeftImmediate = false;
+    if (kTranslateShiftLeftImmediate && (i & 0xBF80FC00) == 0x0F005400) {
+        const u32 Q = (i >> 30) & 1;
+        const u32 immh = (i >> 19) & 15, immb = (i >> 16) & 7;
+        const u32 rn = (i >> 5) & 31, rd = i & 31;
+        u32 size = 0;
+        bool ok = true;
+        if (immh & 8)        size = 3;
+        else if (immh & 4)   size = 2;
+        else if (immh & 2)   size = 1;
+        else if (immh & 1)   size = 0;
+        else                 ok = false;   // immh 0000 is the modified-immediate space
+        // A 64-bit element only exists as 2D.
+        if (size == 3 && !Q) ok = false;
+        if (ok) {
+            const int ebits = 8 << size;
+            const u32 shift = ((immh << 3) | immb) - (u32)ebits;
+            const int esz = ebits / 8;
+            const int bytes = Q ? 16 : 8;
+            const int lanes = bytes / esz;
+            const std::string uty = "uint" + std::to_string(ebits) + "_t";
+            std::string s = "{ " + uty + " _a[" + std::to_string(lanes) + "],_r[" +
+                            std::to_string(lanes) + "]; ";
+            s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
+            s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=(" + uty + ")((" +
+                 uty + ")_a[_i]<<" + std::to_string(shift) + "); ";
+            s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
+                 "][1]=0; ";
+            s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
+            put(s);
+            return true;
+        }
+    }
+
+    // MOVI / MVNI: materialise an immediate into a vector register. The same
+    // encoding with cmode<0> set (below cmode 1100) is ORR/BIC immediate, which
+    // reads the destination instead of replacing it - those fall through.
+    if ((i & 0x9FF80400) == 0x0F000400) {
+        const u32 Q = (i >> 30) & 1, op = (i >> 29) & 1;
+        const u32 cmode = (i >> 12) & 15;
+        const u32 imm8 = ((((i >> 16) & 7) << 5) | ((i >> 5) & 31)) & 0xFF;
+        const u32 rd = i & 31;
+        const u32 hi3 = cmode >> 1;
+        bool ok = true;
+        u64 imm64 = 0;
+        if (hi3 <= 3 && (cmode & 1) == 0) {
+            const u64 v = (u64)imm8 << (8 * hi3);
+            imm64 = (v << 32) | v;
+        } else if ((hi3 == 4 || hi3 == 5) && (cmode & 1) == 0) {
+            const u64 h = ((u64)imm8 << (8 * (hi3 - 4))) & 0xFFFF;
+            imm64 = (h << 48) | (h << 32) | (h << 16) | h;
+        } else if (hi3 == 6) {
+            const u64 v = (cmode & 1) ? (((u64)imm8 << 16) | 0xFFFF)
+                                      : (((u64)imm8 << 8) | 0xFF);
+            imm64 = (v << 32) | v;
+        } else if (cmode == 14) {
+            if (op == 0) {
+                for (int k = 0; k < 8; ++k) imm64 |= (u64)imm8 << (8 * k);
+            } else {
+                // Each bit of imm8 expands to a whole byte of the result.
+                for (int k = 0; k < 8; ++k) {
+                    if ((imm8 >> k) & 1) imm64 |= 0xFFULL << (8 * k);
+                }
+            }
+        } else {
+            ok = false;   // cmode 1111 (FMOV vector) and the ORR/BIC forms
+        }
+        if (ok) {
+            // MVNI inverts, but cmode 1110 is MOVI in both op encodings.
+            if (op == 1 && cmode != 14) imm64 = ~imm64;
+            char lo[32];
+            snprintf(lo, sizeof lo, "0x%llxULL", (unsigned long long)imm64);
+            put("c->vreg[" + std::to_string(rd) + "][0]=" + lo + "; c->vreg[" +
+                std::to_string(rd) + "][1]=" + (Q ? std::string(lo) : std::string("0")) + ";");
+            return true;
+        }
+    }
+
     // LD1R: load one element and replicate it across every lane. Bit 21 is R,
     // which selects LD2R/LD4R - those write a second register and must stay on
     // the fallback, so it has to be in the mask.
