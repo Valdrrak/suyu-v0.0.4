@@ -130,12 +130,12 @@ ordinary emulation. Each is one commit.
 
 - **`suyu-cmd --probe-isa-list`** reports each title's CPU architecture without
   booting it, reading the update's NPDM as well as the base's. An update can
-  change the answer: the target title ships an ARM32 base whose 4.0.0 update
-  is AArch64.
+  change the answer: a title can ship a 32-bit base and a later 64-bit update.
 
 - **Diagnostics** — the NPDM log line carries a content hash, because size is not
-  an identity (two the target title updates share a 1476-byte `main.npdm`, one ARM32 and one
-  AArch64), and `PatchExeFS` names which provider slot answered for an update.
+  an identity - two updates of one title can share a `main.npdm` size while
+  differing in architecture - and `PatchExeFS` names which provider slot
+  answered for an update.
 
 Full change set:
 

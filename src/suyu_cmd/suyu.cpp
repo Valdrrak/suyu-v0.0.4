@@ -268,8 +268,8 @@ static int ProbeIsaList(const std::string& list_path, const std::string& out_pat
         }
         // An update-only NSP holds its Program NCA under TitleType::Update, and
         // the Base lookup above finds nothing at all. That matters here rather
-        // than being a curiosity: the target title ships an ARM32 base and
-        // the whole question is whether a later update rebuilt it as AArch64,
+        // than being a curiosity: where a title ships a 32-bit base, the whole
+        // question is whether a later update rebuilt it as AArch64,
         // which cannot be answered without reading the update's own NPDM.
         if (const auto nca = nsp->GetNCA(tid, FileSys::ContentRecordType::Program,
                                          FileSys::TitleType::Update)) {

@@ -34,11 +34,11 @@ Loader::ResultStatus ProgramMetadata::Load(VirtualFile file) {
     // and nothing else in the boot log says so until BootGame prints the window
     // title.
     //
-    // The hash is here because size alone is not an identity. the target title 8
-    // Deluxe's 2.4.0 and 4.0.0 updates both have a 1476-byte main.npdm, one A32
-    // and one A64, so a log line that prints only the size cannot say which of
-    // the two a given code path actually loaded - and that ambiguity is exactly
-    // what stalled the investigation into which update suyu applies.
+    // The hash is here because size alone is not an identity. Two updates of
+    // one title can share a main.npdm size while differing in architecture, so a
+    // log line that prints only the size cannot say which of the two a given
+    // code path actually loaded - and that ambiguity is exactly what stalled the
+    // investigation into which update suyu applies.
     //
     // FNV-1a rather than SHA256: this only has to distinguish two files in a
     // log, and it keeps the loader free of a crypto dependency.

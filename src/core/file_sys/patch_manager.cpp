@@ -217,8 +217,8 @@ VirtualDir PatchManager::PatchExeFS(VirtualDir exefs) const {
                     // that update shows up here - and this loop takes the FIRST
                     // enabled entry, not the highest version. A newer update
                     // installed to NAND therefore loses to the cartridge's,
-                    // which is how the target title boots its A32 2.4.0
-                    // update while the A64 4.0.0 sits unused in NAND.
+                    // which is how a title can boot an old on-cart update
+                    // while a newer one sits unused in NAND.
                     for (const auto& update_entry : manual_update_versions) {
                         LOG_INFO(Loader,
                                  "DIAG update candidate (manual): version={} ({}.{}.{}) tid={:016X}",

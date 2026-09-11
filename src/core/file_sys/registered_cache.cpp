@@ -561,7 +561,7 @@ VirtualFile RegisteredCache::GetFileAtID(NcaID id) const {
     // no installed update or DLC ever appeared in the cache - silently, since
     // the miss looks identical to nothing being installed.
     //
-    // Concretely: with the target title's A64 4.0.0 update installed to NAND,
+    // Concretely: with a newer update installed to NAND,
     // the union fell through to the frontend's copy of the cartridge contents
     // and applied the A32 on-cart update instead, so the title ran 32-bit.
     for (u8 i = 0; i < 8; ++i) {
@@ -667,10 +667,9 @@ void RegisteredCache::ProcessFiles(const std::vector<NcaID>& ids) {
             // a race with directory scan order: whichever meta NCA the walk
             // reached last won, with no comparison of versions.
             //
-            // the target title with both its 2.4.0 and 4.0.0 updates
-            // installed is the case that exposed it. 4.0.0's meta sits in
-            // 00000087 and 2.4.0's in 000000A4, so the older one was scanned
-            // second and replaced the newer, and the title booted A32.
+            // A title with two updates installed is the case that exposed it:
+            // the older one's meta happened to be scanned second and replaced
+            // the newer, so the title booted the older build.
             CNMT cnmt(section0_file);
             const auto existing = meta.find(nca->GetTitleId());
             if (existing != meta.end() &&

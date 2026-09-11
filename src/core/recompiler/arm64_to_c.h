@@ -1294,7 +1294,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         // CTR_EL0, the cache type register (op0=3 op1=3 CRn=0 CRm=0 op2=1).
         //
         // A constant, and read constantly: 31% of every transition to the
-        // fallback engine on the target title was this one instruction, most
+        // fallback engine on a matrix-heavy title was this one instruction, most
         // of a matrix-heavy title's remaining gap spent marshalling the whole
         // context into dynarmic to fetch a number that never changes.
         //
