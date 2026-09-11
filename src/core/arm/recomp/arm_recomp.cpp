@@ -197,6 +197,16 @@ struct RecompCounters {
     std::map<u32, u64> unhandled_insn;  ///< guest encoding -> times it forced a fallback
     std::map<u64, u64> miss_pc;         ///< PC with no block -> times it forced a fallback
     std::map<u32, u64> svc_numbers;     ///< SVC imm -> times the guest issued it
+    /// Load address -> module name, so a PC in this report can be resolved to
+    /// module+offset. Without it the addresses mean nothing except beside the
+    /// matching boot log, and a report read against another run's log resolves
+    /// to the wrong place without saying so.
+    std::map<u64, std::string> modules;
+
+    void RecordModules(const std::map<u64, std::string>& m) {
+        std::scoped_lock lk{hist_lock};
+        modules = m;
+    }
 
     void RecordSvc(u32 num) {
         std::scoped_lock lk{hist_lock};
@@ -290,10 +300,31 @@ std::string FormatRecompCoverage() {
         o += fmt::format("    {} distinct SVCs\n", g_counters.svc_numbers.size());
     }
 
+    if (!g_counters.modules.empty()) {
+        o += "  --- loaded modules ---\n";
+        for (const auto& [base, name] : g_counters.modules) {
+            o += fmt::format("    {:#018x}  {}\n", base, name);
+        }
+    }
+
     if (!g_counters.miss_pc.empty()) {
+        // Resolved here rather than left to the reader: a bare guest PC
+        // needs this run's load addresses to mean anything, and pairing a
+        // report with another run's log gives a confident wrong answer.
+        const auto resolve = [](u64 pc) -> std::string {
+            u64 best = 0;
+            const std::string* name = nullptr;
+            for (const auto& [base, module_name] : g_counters.modules) {
+                if (pc >= base && base >= best) {
+                    best = base;
+                    name = &module_name;
+                }
+            }
+            return name ? fmt::format("  {}+{:#x}", *name, pc - best) : std::string{};
+        };
         o += "  --- uncovered PCs by execution count ---\n";
         for (const auto& [pc, count] : TopN(g_counters.miss_pc, 16)) {
-            o += fmt::format("    {:#018x}  {:>10}\n", pc, count);
+            o += fmt::format("    {:#018x}  {:>10}{}\n", pc, count, resolve(pc));
         }
         o += fmt::format("    {} distinct PCs\n", g_counters.miss_pc.size());
     }
@@ -503,6 +534,7 @@ struct ArmRecomp::Impl {
             modules_read = true;
             if (auto* process = thread->GetOwnerProcess()) {
                 modules = FindModules(process);
+                g_counters.RecordModules(modules);
                 // Now that the loader has placed everything, tell each image
                 // where its own module went.
                 if (const auto setter = g_recomp_base_setter.load(std::memory_order_acquire)) {
