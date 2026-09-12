@@ -1287,27 +1287,81 @@ static bool SerializeTranslatedBlocks(const NsoAnalysisResult& mod, const QStrin
     return true;
 }
 
+#ifdef _WIN32
+// Every Visual Studio installation that carries the x64 C++ toolset, newest
+// first.
+//
+// This used to be a directory walk of C:/Program Files/Microsoft Visual Studio,
+// which finds an installation only when it is the default edition, on the
+// default drive, of a year the code was written to expect. vswhere ships with
+// every VS installer since 2017 and is the supported way to ask, so it answers
+// for Community, Professional and Build Tools alike wherever they were put.
+static QStringList VisualStudioInstallRoots() {
+    static const QStringList roots = [] {
+        QStringList found;
+        const QString installer_dir = QString::fromLocal8Bit(qgetenv("ProgramFiles(x86)"));
+        if (installer_dir.isEmpty()) {
+            return found;
+        }
+        const QString vswhere =
+            installer_dir + QStringLiteral("/Microsoft Visual Studio/Installer/vswhere.exe");
+        if (!QFile::exists(vswhere)) {
+            return found;
+        }
+        QProcess p;
+        p.start(vswhere,
+                {QStringLiteral("-products"), QStringLiteral("*"), QStringLiteral("-requires"),
+                 QStringLiteral("Microsoft.VisualStudio.Component.VC.Tools.x86.x64"),
+                 QStringLiteral("-sort"), QStringLiteral("-property"),
+                 QStringLiteral("installationPath")});
+        if (!p.waitForFinished(15000)) {
+            p.kill();
+            p.waitForFinished(2000);
+            return found;
+        }
+        const QString out = QString::fromLocal8Bit(p.readAllStandardOutput());
+        for (const auto& line : out.split(QLatin1Char('\n'), Qt::SkipEmptyParts)) {
+            const QString root = QDir::fromNativeSeparators(line.trimmed());
+            if (!root.isEmpty()) {
+                found.append(root);
+            }
+        }
+        return found;
+    }();
+    return roots;
+}
+
+// vcvars64.bat for the newest such installation, or empty when there is none.
+// SUYU_VCVARS overrides the search outright for layouts vswhere cannot see.
+static QString FindVcVars64() {
+    const QString from_env = QString::fromLocal8Bit(qgetenv("SUYU_VCVARS"));
+    if (!from_env.isEmpty() && QFile::exists(from_env)) {
+        return from_env;
+    }
+    for (const auto& root : VisualStudioInstallRoots()) {
+        const QString bat = root + QStringLiteral("/VC/Auxiliary/Build/vcvars64.bat");
+        if (QFile::exists(bat)) {
+            return bat;
+        }
+    }
+    return {};
+}
+#endif
+
 // suyu's own build (and the module/launcher builds this dialog spawns) needs a
 // newer CMake than most systems have first on PATH. Prefer the VS-bundled one.
 static QString FindBestCmakeExecutable() {
-    QStringList candidates;
     const QString path_cmake = QStandardPaths::findExecutable(QStringLiteral("cmake"));
-    for (const auto& vs : QDir(QStringLiteral("C:/Program Files/Microsoft Visual Studio"))
-                             .entryList(QDir::Dirs | QDir::NoDotAndDotDot)) {
-        for (const auto& ed :
-             QDir(QStringLiteral("C:/Program Files/Microsoft Visual Studio/") + vs)
-                 .entryList(QDir::Dirs | QDir::NoDotAndDotDot)) {
-            candidates.append(
-                QStringLiteral("C:/Program Files/Microsoft Visual Studio/%1/%2/Common7/IDE/"
-                               "CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe")
-                    .arg(vs, ed));
-        }
-    }
-    for (const auto& c : candidates) {
+#ifdef _WIN32
+    for (const auto& root : VisualStudioInstallRoots()) {
+        const QString c =
+            root + QStringLiteral(
+                       "/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe");
         if (QFile::exists(c)) {
             return c;
         }
     }
+#endif
     return path_cmake;
 }
 
@@ -1950,17 +2004,13 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             // VS-bundled installs FIRST and only fall back to the
             // cache/PATH ones after.
             QStringList cmake_candidates;
-            for (const auto& vs : QDir(QStringLiteral("C:/Program Files/Microsoft Visual Studio"))
-                                     .entryList(QDir::Dirs | QDir::NoDotAndDotDot)) {
-                for (const auto& ed :
-                     QDir(QStringLiteral("C:/Program Files/Microsoft Visual Studio/") + vs)
-                         .entryList(QDir::Dirs | QDir::NoDotAndDotDot)) {
-                    cmake_candidates.append(
-                        QStringLiteral("C:/Program Files/Microsoft Visual Studio/%1/%2/Common7/IDE/"
-                                       "CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe")
-                            .arg(vs, ed));
-                }
+#ifdef _WIN32
+            for (const auto& root : VisualStudioInstallRoots()) {
+                cmake_candidates.append(
+                    root + QStringLiteral("/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/"
+                                          "bin/cmake.exe"));
             }
+#endif
             cmake_candidates.append(cmake);
             const QString path_cmake = QStandardPaths::findExecutable(QStringLiteral("cmake"));
             if (!path_cmake.isEmpty()) {
@@ -1977,10 +2027,14 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             // the configure and build subprocesses.
             QProcessEnvironment vs_env = QProcessEnvironment::systemEnvironment();
             {
-                const QString vcvars =
-                    QStringLiteral("C:/Program Files/Microsoft Visual Studio/2022/Community/VC/"
-                                   "Auxiliary/Build/vcvars64.bat");
-                if (QFile::exists(vcvars)) {
+#ifdef _WIN32
+                const QString vcvars = FindVcVars64();
+                if (vcvars.isEmpty()) {
+                    LOG_WARNING(Frontend,
+                                "no Visual Studio C++ toolset found - cl.exe and link.exe will "
+                                "not be on PATH for this build, which fails compiler detection. "
+                                "Set SUYU_VCVARS to a vcvars64.bat to override.");
+                } else {
                     QProcess env_proc;
                     QString out;
                     // `set`'s output for a Developer Command Prompt easily exceeds
@@ -2000,6 +2054,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                         }
                     }
                 }
+#endif
             }
 
             QString cmake_exe;
@@ -2082,25 +2137,24 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             QTextStream o(&bw);
             o << "@echo off\r\n"
                  "rem Build all recompiled modules.\r\n"
-                 "rem Auto-detect cmake from Visual Studio if not on PATH.\r\n"
+                 "rem Find cmake: PATH first, then any Visual Studio install.\r\n"
+                 "rem\r\n"
+                 "rem vswhere ships with every VS installer since 2017, so this finds\r\n"
+                 "rem Community, Professional and Build Tools of any year, on any drive.\r\n"
+                 "rem A directory glob of one hardcoded year and edition did not.\r\n"
+                 "set \"CMAKE=cmake\"\r\n"
                  "where cmake >nul 2>&1\r\n"
-                 "if %errorlevel% neq 0 (\r\n"
-                 "  set \"CMAKE_SEARCH=\"\r\n"
-                 "  for /d %%V in (\"C:\\Program Files\\Microsoft Visual Studio\\2022\\*\") do (\r\n"
-                 "    if exist \"%%V\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin\\cmake.exe\" (\r\n"
-                 "      set \"CMAKE_SEARCH=%%V\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin\\cmake.exe\"\r\n"
-                 "    )\r\n"
-                 "  )\r\n"
-                 "  if defined CMAKE_SEARCH (\r\n"
-                 "    echo Using VS cmake: %CMAKE_SEARCH%\r\n"
-                 "    set \"CMAKE=%CMAKE_SEARCH%\"\r\n"
-                 "  ) else (\r\n"
-                 "    echo ERROR: cmake not found. Install CMake or Visual Studio.\r\n"
-                 "    pause & exit /b 1\r\n"
-                 "  )\r\n"
-                 ") else (\r\n"
-                 "  set \"CMAKE=cmake\"\r\n"
-                 ")\r\n"
+                 "if %errorlevel% equ 0 goto have_cmake\r\n"
+                 "set \"VSWHERE=%ProgramFiles(x86)%\\Microsoft Visual Studio\\Installer\\vswhere.exe\"\r\n"
+                 "if not exist \"%VSWHERE%\" goto no_cmake\r\n"
+                 "for /f \"usebackq tokens=*\" %%V in (`\"%VSWHERE%\" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set \"CMAKE=%%V\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin\\cmake.exe\"\r\n"
+                 "if not exist \"%CMAKE%\" goto no_cmake\r\n"
+                 "echo Using Visual Studio cmake: %CMAKE%\r\n"
+                 "goto have_cmake\r\n"
+                 ":no_cmake\r\n"
+                 "echo ERROR: cmake not found. Install CMake or Visual Studio.\r\n"
+                 "pause & exit /b 1\r\n"
+                 ":have_cmake\r\n"
                  "for /d %%M in (*) do (\r\n"
                  "  if exist \"%%M\\CMakeLists.txt\" (\r\n"
                  "    echo Building %%M ...\r\n"
