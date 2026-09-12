@@ -5262,8 +5262,24 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                         }
                         total_entries += static_cast<int>(cache->ListEntries().size());
                         for (const auto& [kind, label] : kinds) {
-                            for (const auto& entry : cache->ListEntriesFilter(
-                                     kind, FileSys::ContentRecordType::Program)) {
+                            // DLC carries its content as Data, not Program -
+                            // see AddOnContentManager and PatchManager, both of
+                            // which filter AOC that way. Asking only for Program
+                            // silently drops every add-on that is installed.
+                            std::vector<FileSys::ContentProviderEntry> found =
+                                cache->ListEntriesFilter(kind,
+                                                         FileSys::ContentRecordType::Program);
+                            for (const auto& data_entry :
+                                 cache->ListEntriesFilter(kind, FileSys::ContentRecordType::Data)) {
+                                const bool already =
+                                    std::any_of(found.begin(), found.end(), [&](const auto& e) {
+                                        return e.title_id == data_entry.title_id;
+                                    });
+                                if (!already) {
+                                    found.push_back(data_entry);
+                                }
+                            }
+                            for (const auto& entry : found) {
                                 QJsonObject title;
                                 title[QStringLiteral("title_id")] =
                                     QStringLiteral("%1")
@@ -5272,9 +5288,15 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                                 title[QStringLiteral("type")] = QLatin1String(label);
                                 title[QStringLiteral("origin")] = origin;
 
-                                // An update's own id ends in 800 and carries no
-                                // control data; that lives under the base id.
-                                const u64 base_id = entry.title_id & ~0xFFFULL;
+                                // Neither an update nor an add-on carries control
+                                // data of its own; the name lives under the base
+                                // title. An update's id is base|0x800, but an
+                                // add-on's is base + 0x1000 + index, so dropping
+                                // the low bits is not enough for those.
+                                const u64 base_id =
+                                    kind == FileSys::TitleType::AOC
+                                        ? (entry.title_id & ~0xFFFULL) - 0x1000ULL
+                                        : entry.title_id & ~0xFFFULL;
                                 const FileSys::PatchManager pm(
                                     base_id, system->GetFileSystemController(),
                                     system->GetContentProvider());
