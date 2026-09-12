@@ -5226,6 +5226,95 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                                    {QStringLiteral("copied_count"), copied_count}};
             };
 
+            // Enumerate what is actually registered in NAND, through the same
+            // content provider the emulator boots from, so the answer matches
+            // what a launch would see rather than what is on disk.
+            mcp_server_->RegisterTool(
+                QStringLiteral("list_installed_titles"),
+                QStringLiteral("List all titles installed in the emulator NAND."),
+                QJsonObject{{QStringLiteral("type"), QStringLiteral("object")},
+                            {QStringLiteral("properties"), QJsonObject{}}},
+                [this](const QJsonObject& /*params*/) -> QJsonObject {
+                    // Ask per type rather than deriving one from the title id:
+                    // the provider already knows, and the id layout is not
+                    // something to re-derive here.
+                    const std::array<std::pair<FileSys::TitleType, const char*>, 10> kinds{{
+                        {FileSys::TitleType::SystemProgram, "SystemProgram"},
+                        {FileSys::TitleType::SystemDataArchive, "SystemDataArchive"},
+                        {FileSys::TitleType::SystemUpdate, "SystemUpdate"},
+                        {FileSys::TitleType::FirmwarePackageA, "FirmwarePackageA"},
+                        {FileSys::TitleType::FirmwarePackageB, "FirmwarePackageB"},
+                        {FileSys::TitleType::Application, "Application"},
+                        {FileSys::TitleType::Update, "Update"},
+                        {FileSys::TitleType::AOC, "DLC"},
+                        {FileSys::TitleType::DeltaTitle, "DeltaTitle"},
+                        {FileSys::TitleType::DataPatch, "DataPatch"},
+                    }};
+
+                    QJsonArray titles;
+                    // Every record of every type, so a count that does not match
+                    // the listing above is visible rather than silent.
+                    int total_entries = 0;
+                    const auto add_entries = [&](FileSys::RegisteredCache* cache,
+                                                 const QString& origin) {
+                        if (cache == nullptr) {
+                            return;
+                        }
+                        total_entries += static_cast<int>(cache->ListEntries().size());
+                        for (const auto& [kind, label] : kinds) {
+                            for (const auto& entry : cache->ListEntriesFilter(
+                                     kind, FileSys::ContentRecordType::Program)) {
+                                QJsonObject title;
+                                title[QStringLiteral("title_id")] =
+                                    QStringLiteral("%1")
+                                        .arg(entry.title_id, 16, 16, QLatin1Char('0'))
+                                        .toUpper();
+                                title[QStringLiteral("type")] = QLatin1String(label);
+                                title[QStringLiteral("origin")] = origin;
+
+                                // An update's own id ends in 800 and carries no
+                                // control data; that lives under the base id.
+                                const u64 base_id = entry.title_id & ~0xFFFULL;
+                                const FileSys::PatchManager pm(
+                                    base_id, system->GetFileSystemController(),
+                                    system->GetContentProvider());
+                                const auto metadata = pm.GetControlMetadata();
+                                if (metadata.first != nullptr) {
+                                    title[QStringLiteral("name")] = QString::fromStdString(
+                                        metadata.first->GetApplicationName());
+                                }
+                                if (const auto version = cache->GetEntryVersion(entry.title_id)) {
+                                    title[QStringLiteral("version")] =
+                                        static_cast<qint64>(*version);
+                                    // Byte-wise, matching FormatTitleVersion in
+                                    // patch_manager.cpp - that one is file-local,
+                                    // so the layout is repeated rather than
+                                    // guessed at.
+                                    title[QStringLiteral("version_string")] =
+                                        QStringLiteral("v%1.%2.%3")
+                                            .arg((*version >> 24) & 0xFF)
+                                            .arg((*version >> 16) & 0xFF)
+                                            .arg((*version >> 8) & 0xFF);
+                                }
+                                titles.append(title);
+                            }
+                        }
+                    };
+
+                    auto& fsc = system->GetFileSystemController();
+                    add_entries(fsc.GetUserNANDContents(), QStringLiteral("UserNAND"));
+                    add_entries(fsc.GetSystemNANDContents(), QStringLiteral("SysNAND"));
+
+                    return QJsonObject{
+                        {QStringLiteral("content_directory"),
+                         QString::fromStdString(Common::FS::PathToUTF8String(
+                             Common::FS::GetSuyuPath(Common::FS::SuyuPath::NANDDir)))},
+                        {QStringLiteral("count"), titles.size()},
+                        {QStringLiteral("total_entries"), total_entries},
+                        {QStringLiteral("titles"), titles},
+                    };
+                });
+
             // Register runtime tools that need access to UISettings / game_list
             mcp_server_->RegisterTool(
                 QStringLiteral("capture_ui_screenshot"),

@@ -204,35 +204,12 @@ void McpServer::RegisterBuiltinTools() {
             };
         });
 
-    // 4) list_installed_titles — scan NAND for installed titles
-    RegisterTool(
-        QStringLiteral("list_installed_titles"),
-        QStringLiteral("List all titles installed in the emulator NAND."),
-        MakeSchema({}),
-        [](const QJsonObject& /*params*/) -> QJsonObject {
-            const QString data_dir =
-                QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
-            const QDir content_dir(data_dir +
-                                   QStringLiteral("/suyu/nand/user/Contents/registered/"));
-
-            QJsonArray titles;
-            if (content_dir.exists()) {
-                const auto entries = content_dir.entryInfoList(
-                    QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
-                for (const auto& entry : entries) {
-                    QJsonObject title;
-                    title[QStringLiteral("name")] = entry.fileName();
-                    title[QStringLiteral("path")] = entry.absoluteFilePath();
-                    titles.append(title);
-                }
-            }
-
-            return QJsonObject{
-                {QStringLiteral("content_directory"), content_dir.absolutePath()},
-                {QStringLiteral("count"), titles.size()},
-                {QStringLiteral("titles"), titles},
-            };
-        });
+    // 4) list_installed_titles is registered in main.cpp, where the filesystem
+    //    controller is in scope. It used to live here, over
+    //    QStandardPaths::GenericDataLocation - which is %LOCALAPPDATA% on
+    //    Windows while the NAND is under %APPDATA%, so it reported an empty
+    //    directory that does not exist no matter what is installed. It also
+    //    listed the content-index folder names rather than any title.
 
     // 5) get_system_info — report emulator and host system information
     RegisterTool(
