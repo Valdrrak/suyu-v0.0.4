@@ -1069,6 +1069,152 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         }
     }
 
+    // SSHLL / USHLL: widen half the source elements and shift them left. SXTL
+    // and UXTL are these with a shift of zero, which is how the assembler spells
+    // them and why they never appeared as their own encoding.
+    if ((i & 0x9F00FC00) == 0x0F00A400) {
+        const u32 Q = (i >> 30) & 1, U = (i >> 29) & 1;
+        const u32 immh = (i >> 19) & 15, immb = (i >> 16) & 7;
+        const u32 rn = (i >> 5) & 31, rd = i & 31;
+        u32 size = 0;
+        bool shaped = true;
+        if (immh & 8)       shaped = false;   // reserved for this encoding
+        else if (immh & 4)  size = 2;
+        else if (immh & 2)  size = 1;
+        else if (immh & 1)  size = 0;
+        else                shaped = false;
+        if (shaped) {
+            const int sbits = 8 << size;
+            const u32 shift = ((immh << 3) | immb) - (u32)sbits;
+            const int ssz = sbits / 8;
+            const int lanes = 8 / ssz;            // always half a register in
+            const int off = Q ? 8 : 0;            // ...the top half when Q is set
+            const std::string sty =
+                (U ? std::string("uint") : std::string("int")) + std::to_string(sbits) + "_t";
+            const std::string dty = "uint" + std::to_string(sbits * 2) + "_t";
+            std::string s = "{ " + sty + " _a[" + std::to_string(lanes) + "]; " + dty + " _r[" +
+                            std::to_string(lanes) + "]; ";
+            s += "memcpy(_a,(const uint8_t*)c->vreg[" + std::to_string(rn) + "]+" +
+                 std::to_string(off) + ",8); ";
+            s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=(" + dty + ")((" +
+                 dty + ")_a[_i]<<" + std::to_string(shift) + "); ";
+            s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r,16); }";
+            put(s);
+            return true;
+        }
+    }
+
+    // ZIP/UZP/TRN. All six are the same read of two registers with a different
+    // index pattern, so they share one emitter.
+    if ((i & 0xBF208C00) == 0x0E000800) {
+        const u32 Q = (i >> 30) & 1;
+        const u32 size = (i >> 22) & 3;
+        const u32 opcode = (i >> 12) & 7;
+        const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
+        const int esz = 1 << size;
+        const int bytes = Q ? 16 : 8;
+        const int lanes = bytes / esz;
+        const char* pattern = nullptr;
+        switch (opcode) {
+        case 1: pattern = "uzp1"; break;
+        case 2: pattern = "trn1"; break;
+        case 3: pattern = "zip1"; break;
+        case 5: pattern = "uzp2"; break;
+        case 6: pattern = "trn2"; break;
+        case 7: pattern = "zip2"; break;
+        default: break;
+        }
+        if (pattern && !(size == 3 && !Q)) {
+            const std::string ty = "uint" + std::to_string(esz * 8) + "_t";
+            const int half = lanes / 2;
+            std::string idx;
+            if (opcode == 3 || opcode == 7) {
+                // ZIP: interleave one half of each source.
+                const int base = (opcode == 7) ? half : 0;
+                idx = "_r[2*_i]=_a[" + std::to_string(base) + "+_i]; _r[2*_i+1]=_b[" +
+                      std::to_string(base) + "+_i];";
+            } else if (opcode == 1 || opcode == 5) {
+                // UZP: take every other element, all of a then all of b.
+                const int first = (opcode == 5) ? 1 : 0;
+                idx = "_r[_i]=_a[2*_i+" + std::to_string(first) + "]; _r[" +
+                      std::to_string(half) + "+_i]=_b[2*_i+" + std::to_string(first) + "];";
+            } else {
+                // TRN: pair up matching even or odd elements.
+                const int first = (opcode == 6) ? 1 : 0;
+                idx = "_r[2*_i]=_a[2*_i+" + std::to_string(first) + "]; _r[2*_i+1]=_b[2*_i+" +
+                      std::to_string(first) + "];";
+            }
+            std::string s = "{ " + ty + " _a[" + std::to_string(lanes) + "],_b[" +
+                            std::to_string(lanes) + "],_r[" + std::to_string(lanes) + "]; ";
+            s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
+            s += "memcpy(_b,c->vreg[" + std::to_string(rm) + "]," + std::to_string(bytes) + "); ";
+            s += "for(int _i=0;_i<" + std::to_string(half) + ";_i++){ " + idx + " } ";
+            s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
+                 "][1]=0; ";
+            s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
+            put(s);
+            return true;
+        }
+    }
+
+    // EXT: a window into Rn:Rm starting imm4 bytes in.
+    if ((i & 0xBFE08400) == 0x2E000000) {
+        const u32 Q = (i >> 30) & 1;
+        const u32 imm4 = (i >> 11) & 15;
+        const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
+        const int bytes = Q ? 16 : 8;
+        if ((int)imm4 < bytes) {
+            std::string s = "{ uint8_t _a[" + std::to_string(bytes) + "],_b[" +
+                            std::to_string(bytes) + "],_r[" + std::to_string(bytes) + "]; ";
+            s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
+            s += "memcpy(_b,c->vreg[" + std::to_string(rm) + "]," + std::to_string(bytes) + "); ";
+            s += "for(int _i=0;_i<" + std::to_string(bytes) + ";_i++){ int _k=_i+" +
+                 std::to_string(imm4) + "; _r[_i] = (_k<" + std::to_string(bytes) +
+                 ") ? _a[_k] : _b[_k-" + std::to_string(bytes) + "]; } ";
+            s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
+                 "][1]=0; ";
+            s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
+            put(s);
+            return true;
+        }
+    }
+
+    // FCMEQ / FCMGE / FCMGT, register forms. The compare-against-zero forms are
+    // handled with the other two-register-misc ops; these take a second vector.
+    // U and size<1> pick which comparison: the two bits are the operator.
+    if ((i & 0x9F20FC00) == 0x0E20E400) {
+        const u32 Q = (i >> 30) & 1, U = (i >> 29) & 1;
+        const u32 size = (i >> 22) & 3;
+        const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
+        const bool dbl = (size & 1) != 0;
+        const char* cmp = nullptr;
+        if (!U && !(size & 2))      cmp = "==";   // FCMEQ
+        else if (U && !(size & 2))  cmp = ">=";   // FCMGE
+        else if (U && (size & 2))   cmp = ">";    // FCMGT
+        if (cmp && !(dbl && !Q)) {
+            const char* ct = dbl ? "double" : "float";
+            const int fsz = dbl ? 8 : 4;
+            const int bytes = Q ? 16 : 8;
+            const int lanes = bytes / fsz;
+            const std::string uty = "uint" + std::to_string(fsz * 8) + "_t";
+            std::string s = "{ " + std::string(ct) + " _a[" + std::to_string(lanes) +
+                            "],_b[" + std::to_string(lanes) + "]; " + uty + " _r[" +
+                            std::to_string(lanes) + "]; ";
+            s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
+            s += "memcpy(_b,c->vreg[" + std::to_string(rm) + "]," + std::to_string(bytes) + "); ";
+            // A NaN operand compares false and the lane comes out zero, which is
+            // what the architecture specifies and what C's comparison already
+            // does - so no NaN test is needed here.
+            s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=(_a[_i]" + cmp +
+                 "_b[_i]) ? (" + uty + ")~(" + uty + ")0 : (" + uty + ")0; ";
+            s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
+                 "][1]=0; ";
+            s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
+            put(s);
+            return true;
+        }
+    }
+
     // USHL / SSHL: shift each lane by the signed low byte of the corresponding
     // lane of Rm - positive shifts left, negative shifts right. Bits 15..11 are
     // pinned because UQSHL (01001) and URSHL (01010) sit immediately next to
@@ -1184,12 +1330,31 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                     if ((imm8 >> k) & 1) imm64 |= 0xFFULL << (8 * k);
                 }
             }
+        } else if (cmode == 15) {
+            // FMOV (vector, immediate). VFPExpandImm, built at double width and
+            // narrowed for the 32-bit form the way the scalar FMOV above does.
+            const u32 sgn = (imm8 >> 7) & 1, b6 = (imm8 >> 6) & 1;
+            const u64 e11 = ((u64)(b6 ^ 1) << 10) | (b6 ? (0xFFULL << 2) : 0ULL) |
+                            ((imm8 >> 4) & 3);
+            const u64 dbits = ((u64)sgn << 63) | (e11 << 52) | ((u64)(imm8 & 0xF) << 48);
+            if (op == 0) {
+                double dv;
+                memcpy(&dv, &dbits, 8);
+                const float fv = (float)dv;
+                u32 fb;
+                memcpy(&fb, &fv, 4);
+                imm64 = ((u64)fb << 32) | fb;
+            } else if (Q) {
+                imm64 = dbits;   // the 64-bit form is 2D only
+            } else {
+                ok = false;
+            }
         } else {
-            ok = false;   // cmode 1111 (FMOV vector) and the ORR/BIC forms
+            ok = false;   // the ORR/BIC immediate forms
         }
         if (ok) {
             // MVNI inverts, but cmode 1110 is MOVI in both op encodings.
-            if (op == 1 && cmode != 14) imm64 = ~imm64;
+            if (op == 1 && cmode < 14) imm64 = ~imm64;
             char lo[32];
             snprintf(lo, sizeof lo, "0x%llxULL", (unsigned long long)imm64);
             put("c->vreg[" + std::to_string(rd) + "][0]=" + lo + "; c->vreg[" +
@@ -1856,6 +2021,25 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 put(s);
                 return true;
             }
+            // CNT: set bits per byte. Defined for byte elements only.
+            if (opcode == 0x05 && ((i >> 22) & 3) == 0 && !U) {
+                const int bytes = Q ? 16 : 8;
+                std::string s = "{ uint8_t _a[" + std::to_string(bytes) + "],_r[" +
+                                std::to_string(bytes) + "]; ";
+                s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," +
+                     std::to_string(bytes) + "); ";
+                s += "for(int _i=0;_i<" + std::to_string(bytes) + ";_i++){ ";
+                s += "uint8_t _v=_a[_i]; _v=(uint8_t)(_v-((_v>>1)&0x55)); ";
+                s += "_v=(uint8_t)((_v&0x33)+((_v>>2)&0x33)); ";
+                s += "_r[_i]=(uint8_t)((_v+(_v>>4))&0x0F); } ";
+                s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" +
+                     std::to_string(rd) + "][1]=0; ";
+                s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," +
+                     std::to_string(bytes) + "); }";
+                put(s);
+                return true;
+            }
+
             // ABS / NEG, lanewise over integer elements. U picks NEG.
             if (opcode == 0x0B) {
                 const u32 size = (i >> 22) & 3;
