@@ -185,6 +185,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "suyu/mcp_server.h"
 #include "suyu/programmer_environment.h"
 #include "suyu/game_export.h"
+#include "suyu/setup_dialog.h"
 #include "suyu/gamer_environment.h"
 #include "suyu/nintendo_account.h"
 #include "suyu/social_sidebar.h"
@@ -1750,6 +1751,7 @@ void GMainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_Exit, &QMainWindow::close);
     connect_menu(ui->action_Load_Amiibo, &GMainWindow::OnLoadAmiibo);
     connect_menu(ui->action_Export_Game, &GMainWindow::OnExportGame);
+    connect_menu(ui->action_Setup, &GMainWindow::OnSetup);
 
     // Not in the .ui file: EmulatorCoreManager (src/suyu/emulator_core_manager.*)
     // already has a real, working libretro path - LaunchGame() shells out to
@@ -6017,6 +6019,73 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
 void GMainWindow::OnAbout() {
     AboutDialog aboutDialog(this);
     aboutDialog.exec();
+}
+
+// Count library entries that point at a file that is actually there. The model
+// also carries group rows and "owned://" placeholders, neither of which is
+// something the user can boot, so a plain rowCount() would report a library
+// that is not there.
+static int CountPlayableLibraryEntries(QAbstractItemModel* model) {
+    if (!model) {
+        return 0;
+    }
+    constexpr int kPathRole = Qt::UserRole + 4;
+    int count = 0;
+    std::function<void(const QModelIndex&)> walk = [&](const QModelIndex& parent) {
+        const int rows = model->rowCount(parent);
+        for (int row = 0; row < rows; ++row) {
+            const QModelIndex idx = model->index(row, 0, parent);
+            const QString path = idx.data(kPathRole).toString();
+            if (!path.isEmpty() && !path.startsWith(QStringLiteral("owned://")) &&
+                QFileInfo(path).isFile()) {
+                ++count;
+            }
+            if (model->hasChildren(idx)) {
+                walk(idx);
+            }
+        }
+    };
+    walk(QModelIndex());
+    return count;
+}
+
+void GMainWindow::OnSetup() {
+    QVector<SetupDialog::Step> steps;
+
+    steps.push_back(
+        {tr("Decryption keys"),
+         tr("Your own prod.keys and title.keys. Nothing can be read without them."),
+         [] { return ContentManager::AreKeysPresent(); }, ui->action_Install_Keys,
+         tr("Install Keys..."), {}});
+
+    steps.push_back({tr("Firmware"),
+                     tr("System titles dumped from your own console. Needed for the "
+                        "services games call into."),
+                     [this] { return CheckFirmwarePresence(); }, ui->action_Install_Firmware,
+                     tr("Install Firmware..."), {}});
+
+    steps.push_back(
+        {tr("Games"), tr("Install a dump, and its update, into NAND."),
+         [this] { return game_list && CountPlayableLibraryEntries(game_list->GetModel()) > 0; },
+         ui->action_Install_File_NAND, tr("Install File to NAND..."),
+         [this] {
+             const int n = game_list ? CountPlayableLibraryEntries(game_list->GetModel()) : 0;
+             return tr("%n title(s) in the library.", "", n);
+         }});
+
+    steps.push_back({tr("Recompiled build"),
+                     tr("Optional. Translates the game's CPU code ahead of time; without it "
+                        "everything runs on the JIT."),
+                     [] { return !GameExportDialog::RecompileOutputRoots().isEmpty(); },
+                     ui->action_Export_Game, tr("Export Game..."),
+                     [] {
+                         const QStringList roots = GameExportDialog::RecompileOutputRoots();
+                         return roots.isEmpty() ? QString()
+                                                : tr("Last exported to %1").arg(roots.front());
+                     }});
+
+    SetupDialog dialog(std::move(steps), this);
+    dialog.exec();
 }
 
 void GMainWindow::OnExportGame() {

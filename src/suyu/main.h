@@ -439,6 +439,7 @@ private slots:
     void OnToggleStatusBar();
     void OnToggleFoldersInList();
     void OnExportGame();
+    void OnSetup();
     /// Switch-style first-boot setup. Chains the dialogs that already exist
     /// rather than duplicating them; runs once, then never again.
     void RunFirstRunSetupIfNeeded();

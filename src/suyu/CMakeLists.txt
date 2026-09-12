@@ -278,6 +278,8 @@ add_executable(suyu
     nintendo_account.h
     game_export.cpp
     game_export.h
+    setup_dialog.cpp
+    setup_dialog.h
     gamer_environment.cpp
     gamer_environment.h
     game_library.cpp
