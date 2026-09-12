@@ -1069,6 +1069,95 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         }
     }
 
+    // TBL / TBX: byte-wise table lookup. The table is 1-4 consecutive vector
+    // registers starting at Rn, wrapping at 32, and each byte of Rm indexes it.
+    // An index past the end gives zero for TBL and leaves the byte alone for
+    // TBX, which is the only difference between them.
+    if ((i & 0xBFE08C00) == 0x0E000000) {
+        const u32 Q = (i >> 30) & 1;
+        const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
+        const u32 len = (i >> 13) & 3, op = (i >> 12) & 1;
+        const int regs = (int)len + 1;
+        const int bytes = Q ? 16 : 8;
+        const int tbl_bytes = regs * 16;
+        std::string s = "{ uint8_t _t[" + std::to_string(tbl_bytes) + "],_x[" +
+                        std::to_string(bytes) + "],_r[" + std::to_string(bytes) + "]; ";
+        for (int k = 0; k < regs; ++k) {
+            // The table wraps at v31, so a run starting near the top comes back
+            // round to v0 rather than reading off the end of the register file.
+            s += "memcpy(_t+" + std::to_string(k * 16) + ",c->vreg[" +
+                 std::to_string((rn + (u32)k) & 31) + "],16); ";
+        }
+        s += "memcpy(_x,c->vreg[" + std::to_string(rm) + "]," + std::to_string(bytes) + "); ";
+        if (op) {
+            s += "memcpy(_r,c->vreg[" + std::to_string(rd) + "]," + std::to_string(bytes) + "); ";
+        }
+        s += "for(int _i=0;_i<" + std::to_string(bytes) + ";_i++){ unsigned _k=_x[_i]; ";
+        s += "if(_k<" + std::to_string(tbl_bytes) + "U) _r[_i]=_t[_k];";
+        if (!op) {
+            s += " else _r[_i]=0;";
+        }
+        s += " } ";
+        s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
+             "][1]=0; ";
+        s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
+        put(s);
+        return true;
+    }
+
+    // LD1 / ST1, one element. Unlike most vector loads this leaves the rest of
+    // the register alone, so the destination is not zeroed. Bit 23 selects the
+    // post-index form, where Rm of 31 means "advance by the element size" and
+    // anything else names a register to advance by.
+    if ((i & 0xBF200000) == 0x0D000000) {
+        const u32 Q = (i >> 30) & 1;
+        const bool post = ((i >> 23) & 1) != 0;
+        const bool load = ((i >> 22) & 1) != 0;
+        const u32 rm = (i >> 16) & 31;
+        const u32 opcode = (i >> 13) & 7, S = (i >> 12) & 1, size = (i >> 10) & 3;
+        const u32 rn = (i >> 5) & 31, rt = i & 31;
+        int esz = 0, index = 0;
+        bool shaped = true;
+        if (opcode == 0) {
+            esz = 1;
+            index = (int)((Q << 3) | (S << 2) | size);
+        } else if (opcode == 2 && (size & 1) == 0) {
+            esz = 2;
+            index = (int)((Q << 2) | (S << 1) | (size >> 1));
+        } else if (opcode == 4 && size == 0) {
+            esz = 4;
+            index = (int)((Q << 1) | S);
+        } else if (opcode == 4 && size == 1 && S == 0) {
+            esz = 8;
+            index = (int)Q;
+        } else {
+            shaped = false;   // LD2/LD3/LD4 and the replicating forms
+        }
+        // Only the no-offset form may have a register field of zero meaning
+        // "no offset"; in the post-index form that field is Rm.
+        if (shaped && (post || rm == 0)) {
+            const int bits = esz * 8;
+            std::string s = "{ uint64_t _a=" + Xsp(rn) + "; ";
+            if (load) {
+                s += "uint64_t _v=recomp_load" + std::to_string(bits) + "(c,_a); ";
+                s += "memcpy((uint8_t*)c->vreg[" + std::to_string(rt) + "]+" +
+                     std::to_string(index * esz) + ",&_v," + std::to_string(esz) + "); ";
+            } else {
+                s += "uint64_t _v=0; memcpy(&_v,(const uint8_t*)c->vreg[" + std::to_string(rt) +
+                     "]+" + std::to_string(index * esz) + "," + std::to_string(esz) + "); ";
+                s += "recomp_store" + std::to_string(bits) + "(c,_a,_v); ";
+            }
+            if (post) {
+                const std::string step =
+                    (rm == 31) ? (std::to_string(esz) + "ULL") : ("c->x[" + std::to_string(rm) + "]");
+                s += "c->x[" + std::to_string(rn) + "]=_a+" + step + "; ";
+            }
+            s += "}";
+            put(s);
+            return true;
+        }
+    }
+
     // SSHLL / USHLL: widen half the source elements and shift them left. SXTL
     // and UXTL are these with a shift of zero, which is how the assembler spells
     // them and why they never appeared as their own encoding.
