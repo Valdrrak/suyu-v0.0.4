@@ -1069,6 +1069,42 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         }
     }
 
+    // BSL / BIT / BIF: bitwise select. All three are the same operation with a
+    // different choice of which register supplies the mask and which the
+    // destination, so size picks the variant rather than an element width.
+    // U must be set; the U=0 half of this encoding is AND/BIC/ORR/ORN.
+    if ((i & 0xBF20FC00) == 0x2E201C00) {
+        const u32 Q = (i >> 30) & 1;
+        const u32 size = (i >> 22) & 3;
+        const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
+        if (size != 0) {   // size 0 is EOR, handled with the other logicals
+            const int halves = Q ? 2 : 1;
+            std::string s = "{ ";
+            for (int h = 0; h < halves; ++h) {
+                const std::string k = "[" + std::to_string(h) + "]";
+                const std::string d = "c->vreg[" + std::to_string(rd) + "]" + k;
+                const std::string n = "c->vreg[" + std::to_string(rn) + "]" + k;
+                const std::string m = "c->vreg[" + std::to_string(rm) + "]" + k;
+                if (size == 1) {
+                    // BSL: the destination is the mask.
+                    s += d + " = (" + d + " & " + n + ") | (~" + d + " & " + m + "); ";
+                } else if (size == 2) {
+                    // BIT: insert where the second source has bits set.
+                    s += d + " = (" + d + " & ~" + m + ") | (" + n + " & " + m + "); ";
+                } else {
+                    // BIF: insert where it has them clear.
+                    s += d + " = (" + d + " & " + m + ") | (" + n + " & ~" + m + "); ";
+                }
+            }
+            if (!Q) {
+                s += "c->vreg[" + std::to_string(rd) + "][1]=0; ";
+            }
+            s += "}";
+            put(s);
+            return true;
+        }
+    }
+
     // TBL / TBX: byte-wise table lookup. The table is 1-4 consecutive vector
     // registers starting at Rn, wrapping at 32, and each byte of Rm indexes it.
     // An index past the end gives zero for TBL and leaves the byte alone for
@@ -2110,6 +2146,95 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 put(s);
                 return true;
             }
+            // FABS / FNEG. size<0> picks the element width, as it does for
+            // every FP op in this class.
+            if (opcode == 0x0E || opcode == 0x0F) {
+                const char* ct = dbl ? "double" : "float";
+                const int fsz = dbl ? 8 : 4;
+                const int bytes = scl_misc ? fsz : (Q ? 16 : 8);
+                const int lanes = bytes / fsz;
+                const char* expr = (opcode == 0x0F)
+                                       ? "-_a[_i]"
+                                       : (dbl ? "fabs(_a[_i])" : "fabsf(_a[_i])");
+                std::string s = "{ " + std::string(ct) + " _a[" + std::to_string(lanes) +
+                                "],_r[" + std::to_string(lanes) + "]; ";
+                s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) +
+                     "); ";
+                s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=" + expr + "; ";
+                s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
+                     "][1]=0; ";
+                s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) +
+                     "); }";
+                put(s);
+                return true;
+            }
+
+            // XTN / XTN2: take the low half of each element. XTN2 writes the
+            // top half of the destination and leaves the bottom alone, which is
+            // the only reason this is not a plain narrowing.
+            if (opcode == 0x12 && !U && !scl_misc) {
+                const u32 size = (i >> 22) & 3;
+                if (size != 3) {
+                    const int dsz = 1 << size;            // destination element
+                    const int lanes = 8 / dsz;            // always half a register out
+                    const std::string sty = "uint" + std::to_string(dsz * 16) + "_t";
+                    const std::string dty = "uint" + std::to_string(dsz * 8) + "_t";
+                    std::string s = "{ " + sty + " _a[" + std::to_string(lanes) + "]; " + dty +
+                                    " _r[" + std::to_string(lanes) + "]; ";
+                    s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "],16); ";
+                    s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=(" + dty +
+                         ")_a[_i]; ";
+                    if (!Q) {
+                        s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" +
+                             std::to_string(rd) + "][1]=0; ";
+                    }
+                    s += "memcpy((uint8_t*)c->vreg[" + std::to_string(rd) + "]+" +
+                         std::to_string(Q ? 8 : 0) + ",_r,8); }";
+                    put(s);
+                    return true;
+                }
+            }
+
+            // FCVTZS / FCVTZU, vector. Round toward zero and saturate, the same
+            // contract as the scalar forms further up.
+            if (opcode == 0x1B) {
+                const char* ct = dbl ? "double" : "float";
+                const int fsz = dbl ? 8 : 4;
+                const int bytes = scl_misc ? fsz : (Q ? 16 : 8);
+                const int lanes = bytes / fsz;
+                const std::string ity =
+                    (U ? std::string("uint") : std::string("int")) + std::to_string(fsz * 8) + "_t";
+                const std::string uty = "uint" + std::to_string(fsz * 8) + "_t";
+                const char* lo_bound = dbl ? (U ? "0.0" : "-9223372036854775808.0")
+                                           : (U ? "0.0" : "-2147483648.0");
+                const char* hi_bound = dbl ? (U ? "18446744073709551615.0"
+                                                : "9223372036854775807.0")
+                                           : (U ? "4294967295.0" : "2147483647.0");
+                const char* sat_lo = dbl ? (U ? "0ULL" : "0x8000000000000000ULL")
+                                         : (U ? "0ULL" : "0xFFFFFFFF80000000ULL");
+                const char* sat_hi = dbl ? (U ? "0xFFFFFFFFFFFFFFFFULL"
+                                              : "0x7FFFFFFFFFFFFFFFULL")
+                                         : (U ? "0xFFFFFFFFULL" : "0x7FFFFFFFULL");
+                std::string s = "{ " + std::string(ct) + " _a[" + std::to_string(lanes) + "]; " +
+                                uty + " _r[" + std::to_string(lanes) + "]; ";
+                s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) +
+                     "); ";
+                s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++){ " + std::string(ct) +
+                     " _v=_a[_i]; ";
+                s += "if(_v!=_v) _r[_i]=(" + uty + ")0; ";
+                s += std::string("else if(!(_v > (") + ct + ")" + lo_bound + ")) _r[_i]=(" + uty +
+                     ")" + sat_lo + "; ";
+                s += std::string("else if(!(_v < (") + ct + ")" + hi_bound + ")) _r[_i]=(" + uty +
+                     ")" + sat_hi + "; ";
+                s += "else _r[_i]=(" + uty + ")(" + ity + ")_v; } ";
+                s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
+                     "][1]=0; ";
+                s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) +
+                     "); }";
+                put(s);
+                return true;
+            }
+
             // CNT: set bits per byte. Defined for byte elements only.
             if (opcode == 0x05 && ((i >> 22) & 3) == 0 && !U) {
                 const int bytes = Q ? 16 : 8;
