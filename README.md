@@ -14,29 +14,15 @@ Nintendo Switch emulator and native recompiler — based on <a href="https://git
 
 <p align="center">
   <a href="#status">Status</a> |
-  <a href="#changes-in-v005">Changes in v0.0.5</a> |
   <a href="#building">Building</a> |
   <a href="#license">License</a>
 </p>
 
 ---
 
-> **This is a continuation of suyu, which was archived upstream at v0.04.**
+> **This is the final public release of suyu — v0.04. This repository is a public archive.**
 >
-> [`suyu-emu/suyu-v0.0.4`](https://github.com/suyu-emu/suyu-v0.0.4) is a public
-> archive and no further development was planned there. This fork picks it up
-> from commit `d1d09321d7` and continues the numbering: **v0.0.5**.
->
-> The name and version line are kept deliberately, so the lineage stays legible.
-> `BUILD_FULLNAME` reads `suyu v0.0.5 (mk8-recomp)` — the suffix says *which*
-> 0.0.5 a binary is, since the archived repository could in principle be picked
-> up by others too. See [PROVENANCE.md](PROVENANCE.md).
->
-> Work happens on the `mk8-recomp` branch, driven by
-> [mk8-recomp](https://github.com/dougchansan/mk8-recomp) — a project statically
-> recompiling Switch titles to native x86-64 using this recompiler. Fixes that
-> are not recompiler-specific are listed below and are useful to anyone running
-> suyu.
+> No further development or downloads are planned. The codebase is preserved here under GPL-3.0 for historical reference and community use.
 
 ## About
 
@@ -49,99 +35,9 @@ Based on [Eden](https://git.eden-emu.dev/eden-emu/eden), with suyu's own improve
 
 ## Status
 
-Current version: **v0.0.5**, continuing from the archived v0.04.
+Final version: **v0.04**. Automated builds are published to the [releases page](../../releases) by GitHub Actions (Windows, Linux, Android).
 
-Upstream was inconsistent about its own version — the repository is named
-`suyu-v0.0.4`, the tag reads `v0.04-latest`, and `BUILD_FULLNAME` was hardcoded
-to `v0.04`. This fork normalises to the three-part form. Read literally, `v0.04`
-means 0.4, which was evidently not the intent.
-
-Platforms: Windows and Linux both build and run. Android is inherited from
-upstream and untested since the fork; macOS/iOS are not included.
-
-Linux needs five things Windows does not, all handled by
-[`scripts/build-suyu.sh`][bld] in the consuming project:
-
-- CMake 3.31 (`CMakeModules/CPMUtil.cmake` requires it; Ubuntu 24.04 ships 3.28)
-- `-Dfmt_FORCE_BUNDLED=ON` — the system fmt 9 has no `format_string::get()`, and
-  suyu only forces the bundled one inside a branch that does not apply here
-- Qt6 Charts, which Ubuntu packages separately
-- system Boost
-- skipping the `externals/ownfoil` submodule, whose own nested submodule no
-  longer resolves; nothing in suyu's CMake references it
-
-Building on Linux found two defects that MSVC had silently accepted: literal
-carriage returns inside string literals, and a boost forwarding header that
-resolved only where CPM had fetched boost.
-
-[bld]: https://github.com/dougchansan/mk8-recomp/blob/main/scripts/build-suyu.sh
-
-## Changes in v0.0.5
-
-Five of these are defects in suyu itself rather than recompiler work, and affect
-ordinary emulation. Each is one commit.
-
-### Fixes
-
-- **Installed updates and DLC in NAND were never indexed.** `GetFileAtID` tried
-  eight storage-layout variants but skipped every odd index except 7, so the
-  `.cnmt.nca` suffix was only ever looked for at the cache root — never inside a
-  `000000XX/` directory, which is exactly where meta NCAs are stored and what
-  `InstallEntry` writes. Every meta NCA in NAND was therefore unreachable and no
-  installed update or DLC ever entered the cache, silently: a miss is
-  indistinguishable from nothing being installed, which is why the frontend's
-  installed-title listing reported zero. A second defect behind it let an older
-  update overwrite a newer one, because the metadata map is keyed by title id
-  with no version comparison — now the higher `GetTitleVersion()` wins.
-
-- **Service handler registration dropped most commands.** A
-  `FunctionInfoTyped<T>` array was walked through a `FunctionInfoBase*` with a
-  different member layout. `sizeof()` agrees, so a size assertion passes and
-  tells you nothing, but every element after the first was read from the wrong
-  offset. `IpcController` registered 2 of its 6 handlers;
-  `QueryPointerBufferSize` was among the lost, and it is part of CMIF session
-  setup — so titles stalled in early service initialisation.
-
-- **RomFS registration was silently dropped.** `emplace` where
-  `insert_or_assign` was meant, so re-registration kept the stale entry and the
-  title panicked on boot.
-
-- **AOT image dispatch resolved every PC to the wrong module.** Double base
-  subtraction made every lookup underflow, and a four-entry module table
-  mismapped any title with more than one subsdk.
-
-- **The AOT exporter read the base ExeFS, not the update's.** `PatchManager`
-  replaces the ExeFS wholesale when an update is present, so the exported image
-  diverged from live execution on any updated title.
-
-### Additions
-
-- **AArch64 → C recompiler work.** Exclusives now route through
-  `Core::ExclusiveMonitor` (previously a plain load/store with `STXR` always
-  reporting success, which makes every compare-and-swap non-atomic under real
-  threads); FPCR/FPSR are modelled; the counter and `CTR_EL0` are read from the
-  emulator's own sources so the two engines cannot disagree across a transition.
-  Plus EXTR/ROR, ADC/SBC, LDPSW, exclusive pair forms, PRFM, and the DC
-  cache-maintenance family.
-
-- **Static and runtime coverage instrumentation** — per-module JSON of
-  emitted/unhandled counts, and runtime histograms of blocks executed,
-  transitions by cause, unimplemented opcodes and SVCs.
-
-- **`suyu-cmd --probe-isa-list`** reports each title's CPU architecture without
-  booting it, reading the update's NPDM as well as the base's. An update can
-  change the answer: a title can ship a 32-bit base and a later 64-bit update.
-
-- **Diagnostics** — the NPDM log line carries a content hash, because size is not
-  an identity - two updates of one title can share a `main.npdm` size while
-  differing in architecture - and `PatchExeFS` names which provider slot
-  answered for an update.
-
-Full change set:
-
-```
-git diff d1d09321d7ab84252291e05b3efbc8a8dfa57481..mk8-recomp
-```
+Platforms: Windows, Linux, Android. macOS/iOS not included in this release.
 
 ## Legal Notice
 
