@@ -674,9 +674,20 @@ void RegisteredCache::ProcessFiles(const std::vector<NcaID>& ids) {
             const auto existing = meta.find(nca->GetTitleId());
             if (existing != meta.end() &&
                 existing->second.GetTitleVersion() > cnmt.GetTitleVersion()) {
-                LOG_DEBUG(Loader, "DIAG meta kept newer: tid={:016X} keeping v{} over v{}",
+                // Name the superseded meta and everything it points at. A
+                // second copy of a title is dead weight - a whole extra
+                // program NCA - and without this the only way to find which
+                // files belong to it is to delete one and see what breaks.
+                LOG_DEBUG(Loader,
+                          "DIAG meta kept newer: tid={:016X} keeping v{} over v{}; superseded "
+                          "meta nca={}",
                           nca->GetTitleId(), existing->second.GetTitleVersion(),
-                          cnmt.GetTitleVersion());
+                          cnmt.GetTitleVersion(), Common::HexToString(id));
+                for (const auto& record : cnmt.GetContentRecords()) {
+                    LOG_DEBUG(Loader, "DIAG   superseded content: type={} nca={}",
+                              static_cast<int>(record.type),
+                              Common::HexToString(record.nca_id));
+                }
                 break;
             }
             LOG_DEBUG(Loader, "DIAG meta registered: tid={:016X} v{}", nca->GetTitleId(),
