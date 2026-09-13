@@ -323,10 +323,60 @@ jobs:
           name: libretro-windows
           path: suyu-libretro-core-windows-x64.zip
 
+  build-libretro-android:
+    name: Libretro Android
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Init submodules
+        run: |
+          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+      - name: Fix submodule headers
+        run: |
+          f="externals/dynarmic/externals/mcl/include/boost/variant.hpp"
+          if [ -f "$f" ] && grep -q 'C:/Users' "$f"; then
+            printf '// Forwarding header\n#include <boost/variant/variant.hpp>\n#include <boost/variant/recursive_variant.hpp>\n#include <boost/variant/recursive_wrapper.hpp>\n#include <boost/variant/get.hpp>\n#include <boost/variant/apply_visitor.hpp>\n#include <boost/variant/static_visitor.hpp>\n#include <boost/variant/visitor_ptr.hpp>\n' > "$f"
+          fi
+      - name: Install native deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build glslang-tools
+      - name: Install Android NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;28.2.13676358" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+      - name: Configure
+        run: |
+          set -o pipefail
+          cmake -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSUYU_BUILD_LIBRETRO_CORE=ON -DENABLE_QT=OFF -GNinja 2>&1 | tee cmake_configure.log
+      - name: Upload cmake log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmake-log-libretro-android
+          path: cmake_configure.log
+      - name: Build
+        run: cmake --build build --target suyu_libretro -j4
+      - name: Package
+        run: |
+          rm -rf _pkg && mkdir _pkg
+          find build -name '*suyu_libretro*.so' -exec cp {} _pkg/suyu_libretro_android_arm64-v8a.so \;
+          tar -czf suyu-libretro-core-android-arm64.tar.gz -C _pkg .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libretro-android
+          path: suyu-libretro-core-android-arm64.tar.gz
+
   release:
     name: Publish Release
     if: always()
-    needs: [build-windows, build-linux, build-macos, build-freebsd, build-android, build-libretro, build-libretro-windows]
+    needs: [build-windows, build-linux, build-macos, build-freebsd, build-android, build-libretro, build-libretro-windows, build-libretro-android]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
