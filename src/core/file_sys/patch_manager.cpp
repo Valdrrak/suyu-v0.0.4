@@ -8,6 +8,9 @@
 #include <array>
 #include <cstddef>
 #include <cstring>
+#include <mutex>
+#include <utility>
+#include <vector>
 
 #include "common/hex_util.h"
 #include "common/logging.h"
@@ -608,6 +611,28 @@ static void ApplyLayeredFS(VirtualFile& romfs, u64 title_id, ContentRecordType t
     romfs = std::move(packed);
 }
 
+namespace {
+std::mutex unapplied_lock;
+std::vector<UnappliedUpdate> unapplied_updates;
+} // Anonymous namespace
+
+void RecordUnappliedUpdate(u64 title_id, u32 version) {
+    std::scoped_lock lk{unapplied_lock};
+    // The loader patches several content types per boot and would otherwise
+    // record the same title repeatedly.
+    for (const auto& entry : unapplied_updates) {
+        if (entry.title_id == title_id) {
+            return;
+        }
+    }
+    unapplied_updates.push_back({title_id, version});
+}
+
+std::vector<UnappliedUpdate> ConsumeUnappliedUpdates() {
+    std::scoped_lock lk{unapplied_lock};
+    return std::exchange(unapplied_updates, {});
+}
+
 VirtualFile PatchManager::PatchRomFS(const NCA* base_nca, VirtualFile base_romfs,
                                      ContentRecordType type, VirtualFile packed_update_raw,
                                      bool apply_layeredfs) const {
@@ -710,15 +735,35 @@ VirtualFile PatchManager::PatchRomFS(const NCA* base_nca, VirtualFile base_romfs
         }
     }
 
+    const auto installed_version = enabled_version.has_value()
+                                       ? enabled_version
+                                       : content_provider.GetEntryVersion(update_tid);
+
     if (!update_disabled && update_raw != nullptr && base_nca != nullptr) {
         const auto new_nca = std::make_shared<NCA>(update_raw, base_nca);
         if (new_nca->GetStatus() == Loader::ResultStatus::Success &&
             new_nca->GetRomFS() != nullptr) {
             LOG_INFO(Loader, "    RomFS: Update ({}) applied successfully",
-                     enabled_version.has_value() ? FormatTitleVersion(*enabled_version) :
-                     FormatTitleVersion(content_provider.GetEntryVersion(update_tid).value_or(0)));
+                     FormatTitleVersion(installed_version.value_or(0)));
             romfs = new_nca->GetRomFS();
+        } else if (type == ContentRecordType::Program) {
+            LOG_ERROR(Loader,
+                      "    RomFS: Update ({}) for title_id={:016X} is installed but could not be "
+                      "read (nca status={}); the game will run UNPATCHED",
+                      FormatTitleVersion(installed_version.value_or(0)), title_id,
+                      static_cast<int>(new_nca->GetStatus()));
+            RecordUnappliedUpdate(title_id, installed_version.value_or(0));
         }
+    } else if (!update_disabled && update_raw == nullptr && base_nca != nullptr &&
+               packed_update_raw == nullptr && installed_version.has_value() &&
+               type == ContentRecordType::Program) {
+        // Registered, enabled, and the provider still handed back nothing -
+        // the NCA the index points at could not be opened at all.
+        LOG_ERROR(Loader,
+                  "    RomFS: Update ({}) for title_id={:016X} is installed but its content could "
+                  "not be opened; the game will run UNPATCHED",
+                  FormatTitleVersion(*installed_version), title_id);
+        RecordUnappliedUpdate(title_id, *installed_version);
     } else if (!update_disabled && packed_update_raw != nullptr && base_nca != nullptr) {
         const auto new_nca = std::make_shared<NCA>(packed_update_raw, base_nca);
         if (new_nca->GetStatus() == Loader::ResultStatus::Success &&

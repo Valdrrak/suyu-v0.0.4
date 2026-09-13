@@ -7370,6 +7370,34 @@ void GMainWindow::UpdateStatusBar() {
         return;
     }
 
+    // An installed update that could not be read leaves the base game running
+    // unpatched. Nothing about that is visible: the boot succeeds, and the only
+    // outward sign is a version in the title bar the user has nothing to
+    // compare against.
+    //
+    // This is checked here rather than at boot because the game asks for its
+    // RomFS well after the window title is set - tens of seconds into loading
+    // on a large title - so a check next to UpdateWindowTitle always ran before
+    // there was anything to report. ConsumeUnappliedUpdates clears what it
+    // returns, so this fires once even at a 500 ms cadence.
+    for (const auto& unapplied : FileSys::ConsumeUnappliedUpdates()) {
+        const auto version = QStringLiteral("v%1.%2.%3")
+                                 .arg((unapplied.version >> 24) & 0xFF)
+                                 .arg((unapplied.version >> 16) & 0xFF)
+                                 .arg((unapplied.version >> 8) & 0xFF);
+        QMessageBox::warning(
+            this, tr("Update Not Applied"),
+            tr("An update for this title is installed, but its content could not be read, so "
+               "the game is running unpatched.\n\n"
+               "Title ID: %1\nUpdate: %2\n\n"
+               "The usual causes are another program holding the file open, or an install "
+               "that did not complete. The log names the file that could not be opened.")
+                .arg(QStringLiteral("%1")
+                         .arg(unapplied.title_id, 16, 16, QLatin1Char('0'))
+                         .toUpper(),
+                     version));
+    }
+
     if (Settings::values.tas_enable) {
         tas_label->setText(GetTasStateDescription());
     } else {

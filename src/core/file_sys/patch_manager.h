@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 #include "common/common_types.h"
 #include "core/file_sys/nca_metadata.h"
 #include "core/file_sys/vfs/vfs_types.h"
@@ -30,6 +31,24 @@ class NCA;
 class NACP;
 
 enum class PatchType { Update, DLC, Mod };
+
+/// An update that is installed and enabled but whose content could not be read
+/// - the NCA is missing, locked by another process, or fails to decrypt.
+///
+/// This is worth reporting rather than logging quietly: the base game still
+/// boots, just unpatched, which looks exactly like having no update installed.
+/// The only outward sign is a different version in the window title, and a user
+/// who does not know which version to expect has nothing to compare against.
+struct UnappliedUpdate {
+    u64 title_id;
+    u32 version;
+};
+
+/// Record that @p title_id's registered update could not be applied.
+void RecordUnappliedUpdate(u64 title_id, u32 version);
+/// Every update recorded since the last call, clearing the list.
+std::vector<UnappliedUpdate> ConsumeUnappliedUpdates();
+
 
 enum class PatchSource {
     Unknown,
