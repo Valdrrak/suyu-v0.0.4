@@ -1184,6 +1184,27 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
     if ((i & 0xFFFE0C00) == 0x4E280800) {
         const u32 opcode = (i >> 12) & 0x1F;
         const u32 rn = (i >> 5) & 31, rd = i & 31;
+        if (opcode == 4 || opcode == 5) {
+            // AESE: Vd = SubBytes(ShiftRows(Vd EOR Vn)).
+            // AESD is the same with the inverse of each step. ShiftRows rotates
+            // row r left by r, which over the column-major state is a shift of
+            // 4*(i&3) - the permutation dynarmic spells out byte by byte.
+            const bool dec = (opcode == 5);
+            std::string s = "{ uint8_t _s[16],_k[16],_t[16]; const uint8_t* _sb=recomp_aes_sbox(" +
+                            std::string(dec ? "1" : "0") + "); ";
+            s += "memcpy(_s,c->vreg[" + std::to_string(rd) + "],16); ";
+            s += "memcpy(_k,c->vreg[" + std::to_string(rn) + "],16); ";
+            s += "for(int _i=0;_i<16;_i++) _s[_i]=(uint8_t)(_s[_i]^_k[_i]); ";
+            if (dec) {
+                s += "for(int _i=0;_i<16;_i++) _t[_i]=_s[(_i+16-4*(_i&3))&15]; ";
+            } else {
+                s += "for(int _i=0;_i<16;_i++) _t[_i]=_s[(_i+4*(_i&3))&15]; ";
+            }
+            s += "for(int _i=0;_i<16;_i++) _t[_i]=_sb[_t[_i]]; ";
+            s += "memcpy(c->vreg[" + std::to_string(rd) + "],_t,16); }";
+            put(s);
+            return true;
+        }
         if (opcode == 6 || opcode == 7) {
             const char* mtx = (opcode == 7)
                                   ? "{14,11,13,9},{9,14,11,13},{13,9,14,11},{11,13,9,14}"
@@ -3963,6 +3984,8 @@ void recomp_store8(GuestContext*,uint64_t,uint64_t); void recomp_store16(GuestCo
 void recomp_store32(GuestContext*,uint64_t,uint64_t); void recomp_store64(GuestContext*,uint64_t,uint64_t);
 void recomp_svc(GuestContext*,unsigned); void recomp_unhandled(GuestContext*,uint32_t,uint64_t);
 void recomp_barrier(void);
+/* AES S-box, forward or inverse. Built on first call. */
+const uint8_t* recomp_aes_sbox(int inverse);
 /* Load-exclusive: marks the address and returns its contents.
    Store-exclusive: returns 0 on success and 1 if the mark was lost, which is
    the sense of the status register STXR writes (0 = stored). */
@@ -4204,7 +4227,44 @@ int recomp_save_write(GuestContext* c, const char* name, const void* data, uint6
   /* Ensure parent dirs exist */
   char parent[1024]; snprintf(parent,sizeof parent,"%s",path);
   char* sl=strrchr(parent,PATH_SEP); if(!sl) sl=strrchr(parent,'/'); if(sl)*sl=0;
-)RT") + R"RT(  mkpath(parent);
+)RT") + R"RT(
+/* AES S-box, built once on first use.
+   S(x) = affine(x^-1), and x^-1 is x^254 because x^255 == 1 for non-zero x.
+   Generated rather than tabulated: two 256-byte tables written out as source
+   would be 512 bytes of literal in a runtime already split to stay under
+   MSVC's 16380-byte cap. Checked against FIPS 197 and for round-trip. */
+static uint8_t recomp_gmul(uint8_t a, uint8_t b){
+  uint8_t p=0;
+  while(b){ if(b&1) p^=a; a=(uint8_t)((a<<1)^((a>>7)*0x1B)); b=(uint8_t)(b>>1); }
+  return p;
+}
+static uint8_t recomp_ginv(uint8_t x){
+  uint8_t p=1; int b;
+  if(!x) return 0;
+  for(b=7;b>=0;b--){ p=recomp_gmul(p,p); if((254>>b)&1) p=recomp_gmul(p,x); }
+  return p;
+}
+static uint8_t recomp_rotl8(uint8_t x,int n){ return (uint8_t)((x<<n)|(x>>(8-n))); }
+const uint8_t* recomp_aes_sbox(int inverse){
+  static uint8_t fwd[256], inv[256];
+  static int built = 0;
+  if(!built){
+    int i;
+    for(i=0;i<256;i++){
+      uint8_t b = recomp_ginv((uint8_t)i);
+      fwd[i] = (uint8_t)(b ^ recomp_rotl8(b,1) ^ recomp_rotl8(b,2) ^ recomp_rotl8(b,3)
+                           ^ recomp_rotl8(b,4) ^ 0x63);
+    }
+    for(i=0;i<256;i++){
+      uint8_t b = (uint8_t)(recomp_rotl8((uint8_t)i,1) ^ recomp_rotl8((uint8_t)i,3)
+                            ^ recomp_rotl8((uint8_t)i,6) ^ 0x05);
+      inv[i] = recomp_ginv(b);
+    }
+    built = 1;
+  }
+  return inverse ? inv : fwd;
+}
+)RT" + R"RT(  mkpath(parent);
   FILE* f=fopen(path,"wb");
   if(!f){fprintf(stderr,"[recomp] save write failed: %s\n",path); return 0;}
   fwrite(data,1,(size_t)size,f); fclose(f);
