@@ -1069,6 +1069,115 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         }
     }
 
+    // SHA256SU0: the sigma0 half of the message schedule update.
+    //   W[t] = W[t-16] + s0(W[t-15]) + W[t-7] + s1(W[t-2])
+    // This instruction contributes the first two terms; SHA256SU1 adds the
+    // rest. Verified against the scalar recurrence, not transcribed.
+    if ((i & 0xFFFE0C00) == 0x5E280800) {
+        const u32 opcode = (i >> 12) & 0x1F;
+        const u32 rn = (i >> 5) & 31, rd = i & 31;
+        if (opcode == 2) {
+            std::string s = "{ uint32_t _d[4],_n[4],_t[4],_r[4]; ";
+            s += "memcpy(_d,c->vreg[" + std::to_string(rd) + "],16); ";
+            s += "memcpy(_n,c->vreg[" + std::to_string(rn) + "],16); ";
+            // T is the window one word along: Vn<31:0> : Vd<127:32>.
+            s += "_t[0]=_d[1]; _t[1]=_d[2]; _t[2]=_d[3]; _t[3]=_n[0]; ";
+            s += "for(int _e=0;_e<4;_e++){ uint32_t _x=_t[_e]; ";
+            s += "uint32_t _s0=((_x>>7)|(_x<<25))^((_x>>18)|(_x<<14))^(_x>>3); ";
+            s += "_r[_e]=_s0+_d[_e]; } ";
+            s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r,16); }";
+            put(s);
+            return true;
+        }
+    }
+
+    // SHA256SU1: the sigma1 half, plus the two carried terms. The upper two
+    // words need sigma1 of the two just computed, because W[t+2] depends on
+    // W[t] - which is why this cannot be written as one loop.
+    if ((i & 0xFFE0FC00) == 0x5E006000) {
+        const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
+        std::string s = "{ uint32_t _d[4],_n[4],_m[4],_t0[4],_t1[2],_r[4]; ";
+        s += "memcpy(_d,c->vreg[" + std::to_string(rd) + "],16); ";
+        s += "memcpy(_n,c->vreg[" + std::to_string(rn) + "],16); ";
+        s += "memcpy(_m,c->vreg[" + std::to_string(rm) + "],16); ";
+        s += "_t0[0]=_n[1]; _t0[1]=_n[2]; _t0[2]=_n[3]; _t0[3]=_m[0]; ";
+        s += "_t1[0]=_m[2]; _t1[1]=_m[3]; ";
+        s += "for(int _e=0;_e<2;_e++){ uint32_t _x=_t1[_e]; ";
+        s += "uint32_t _s1=((_x>>17)|(_x<<15))^((_x>>19)|(_x<<13))^(_x>>10); ";
+        s += "_r[_e]=_s1+_d[_e]+_t0[_e]; } ";
+        s += "for(int _e=2;_e<4;_e++){ uint32_t _x=_r[_e-2]; ";
+        s += "uint32_t _s1=((_x>>17)|(_x<<15))^((_x>>19)|(_x<<13))^(_x>>10); ";
+        s += "_r[_e]=_s1+_d[_e]+_t0[_e]; } ";
+        s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r,16); }";
+        put(s);
+        return true;
+    }
+
+    // LD1-LD4 / ST1-ST4, whole registers. opcode says how many registers and
+    // whether they are interleaved: LD2/3/4 spread consecutive elements across
+    // the registers, while the LD1 forms are plain consecutive blocks.
+    if ((i & 0xBFBF0000) == 0x0C000000 || (i & 0xBF800000) == 0x0C800000) {
+        const u32 Q = (i >> 30) & 1;
+        const bool post = ((i >> 23) & 1) != 0;
+        const bool load = ((i >> 22) & 1) != 0;
+        const u32 rm = (i >> 16) & 31;
+        const u32 opcode = (i >> 12) & 15, size = (i >> 10) & 3;
+        const u32 rn = (i >> 5) & 31, rt = i & 31;
+        int regs = 0, step = 0;
+        switch (opcode) {
+        case 0x0: regs = 4; step = 4; break;   // LD4/ST4, interleaved
+        case 0x2: regs = 4; step = 1; break;   // LD1/ST1, four registers
+        case 0x4: regs = 3; step = 3; break;   // LD3/ST3, interleaved
+        case 0x6: regs = 3; step = 1; break;
+        case 0x7: regs = 1; step = 1; break;
+        case 0x8: regs = 2; step = 2; break;   // LD2/ST2, interleaved
+        case 0xA: regs = 2; step = 1; break;
+        default: break;
+        }
+        const int esz = 1 << size;
+        const int bytes = Q ? 16 : 8;
+        // The 64-bit element has no 8-byte form: one element per register is
+        // not an addressing mode the architecture provides here.
+        const bool shaped = regs > 0 && !(size == 3 && !Q);
+        if (shaped) {
+            const int lanes = bytes / esz;
+            const int bits = esz * 8;
+            std::string s = "{ uint64_t _a=" + Xsp(rn) + "; uint64_t _v; ";
+            for (int e = 0; e < lanes; ++e) {
+                for (int r = 0; r < regs; ++r) {
+                    const int off = (step == 1) ? (r * bytes + e * esz)
+                                                : ((e * regs + r) * esz);
+                    const std::string vr = std::to_string((rt + (u32)r) & 31);
+                    const std::string lane = std::to_string(e * esz);
+                    if (load) {
+                        s += "_v=recomp_load" + std::to_string(bits) + "(c,_a+" +
+                             std::to_string(off) + "); memcpy((uint8_t*)c->vreg[" + vr + "]+" +
+                             lane + ",&_v," + std::to_string(esz) + "); ";
+                    } else {
+                        s += "_v=0; memcpy(&_v,(const uint8_t*)c->vreg[" + vr + "]+" + lane + "," +
+                             std::to_string(esz) + "); recomp_store" + std::to_string(bits) +
+                             "(c,_a+" + std::to_string(off) + ",_v); ";
+                    }
+                }
+            }
+            if (load && !Q) {
+                // The 64-bit forms clear the top half of every register written.
+                for (int r = 0; r < regs; ++r) {
+                    s += "c->vreg[" + std::to_string((rt + (u32)r) & 31) + "][1]=0; ";
+                }
+            }
+            if (post) {
+                const std::string adv = (rm == 31)
+                                            ? (std::to_string(regs * bytes) + "ULL")
+                                            : ("c->x[" + std::to_string(rm) + "]");
+                s += "c->x[" + std::to_string(rn) + "]=_a+" + adv + "; ";
+            }
+            s += "}";
+            put(s);
+            return true;
+        }
+    }
+
     // AESMC / AESIMC: the MixColumns step and its inverse. The matrix and the
     // xtime-based GF(2^8) multiply below are dynarmic's
     // (common/crypto/aes.cpp), not written from the specification.
