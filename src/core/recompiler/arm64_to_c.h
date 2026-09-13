@@ -1069,6 +1069,88 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         }
     }
 
+    // AESMC / AESIMC: the MixColumns step and its inverse. The matrix and the
+    // xtime-based GF(2^8) multiply below are dynarmic's
+    // (common/crypto/aes.cpp), not written from the specification.
+    if ((i & 0xFFFE0C00) == 0x4E280800) {
+        const u32 opcode = (i >> 12) & 0x1F;
+        const u32 rn = (i >> 5) & 31, rd = i & 31;
+        if (opcode == 6 || opcode == 7) {
+            const char* mtx = (opcode == 7)
+                                  ? "{14,11,13,9},{9,14,11,13},{13,9,14,11},{11,13,9,14}"
+                                  : "{2,3,1,1},{1,2,3,1},{1,1,2,3},{3,1,1,2}";
+            std::string s = "{ uint8_t _s[16],_r[16]; static const uint8_t _mx[4][4]={";
+            s += mtx;
+            s += "}; memcpy(_s,c->vreg[" + std::to_string(rn) + "],16); ";
+            s += "for(int _cl=0;_cl<16;_cl+=4) for(int _o=0;_o<4;_o++){ uint8_t _acc=0; ";
+            s += "for(int _k=0;_k<4;_k++){ uint8_t _x=_s[_cl+_k],_y=_mx[_o][_k],_pp=0; ";
+            s += "while(_y){ if(_y&1) _pp=(uint8_t)(_pp^_x); ";
+            s += "_x=(uint8_t)((_x<<1)^((_x>>7)*0x1B)); _y=(uint8_t)(_y>>1); } ";
+            s += "_acc=(uint8_t)(_acc^_pp); } _r[_cl+_o]=_acc; } ";
+            s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r,16); }";
+            put(s);
+            return true;
+        }
+    }
+
+    // PMULL / PMULL2: carry-less multiply of the low or high 64-bit halves.
+    if ((i & 0xBF20FC00) == 0x0E20E000) {
+        const u32 Q = (i >> 30) & 1, U = (i >> 29) & 1;
+        const u32 size = (i >> 22) & 3;
+        const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
+        if (!U && size == 3) {
+            const int half = Q ? 1 : 0;   // PMULL2 takes the top half of each source
+            std::string s = "{ uint64_t _a=c->vreg[" + std::to_string(rn) + "][" +
+                            std::to_string(half) + "], _b=c->vreg[" + std::to_string(rm) + "][" +
+                            std::to_string(half) + "]; uint64_t _lo=0,_hi=0; ";
+            s += "for(int _k=0;_k<64;_k++) if((_b>>_k)&1ULL){ _lo^=_a<<_k; ";
+            // Shifting by 64 is undefined, and that is exactly the k=0 case.
+            s += "if(_k) _hi^=_a>>(64-_k); } ";
+            s += "c->vreg[" + std::to_string(rd) + "][0]=_lo; c->vreg[" + std::to_string(rd) +
+                 "][1]=_hi; }";
+            put(s);
+            return true;
+        }
+    }
+
+    // CRC32 / CRC32C. Computed a bit at a time rather than from a table: this
+    // is the same recurrence dynarmic's tables encode, and a cold instruction
+    // does not justify carrying 2 KB of tables in every generated image.
+    if ((i & 0x7FE0E000) == 0x1AC04000) {
+        const u32 sf = i >> 31;
+        const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
+        const u32 castagnoli = (i >> 12) & 1, sz = (i >> 10) & 3;
+        // The 64-bit variant is the sz=11 form only, and it needs sf set.
+        if (!(sz == 3 && !sf) && !(sz != 3 && sf) && rd != 31) {
+            const int nbytes = 1 << sz;
+            const char* poly = castagnoli ? "0x82F63B78UL" : "0xEDB88320UL";
+            std::string s = "{ uint32_t _crc=(uint32_t)" + Xz(rn) + "; uint64_t _v=" + Xz(rm) +
+                            "; ";
+            s += "for(int _i=0;_i<" + std::to_string(nbytes) + ";_i++){ ";
+            s += "_crc^=(uint8_t)(_v>>(8*_i)); ";
+            s += "for(int _b=0;_b<8;_b++) _crc=(_crc>>1)^(" + std::string(poly) +
+                 " & (uint32_t)(-(int32_t)(_crc&1u))); } ";
+            s += "c->x[" + std::to_string(rd) + "]=(uint64_t)_crc; }";
+            put(s);
+            return true;
+        }
+    }
+
+    // FADDP, scalar: add the two lanes of the source together.
+    if ((i & 0xFFBFFC00) == 0x7E30D800) {
+        const bool dbl = ((i >> 22) & 1) != 0;
+        const u32 rn = (i >> 5) & 31, rd = i & 31;
+        const char* ct = dbl ? "double" : "float";
+        const int fsz = dbl ? 8 : 4;
+        std::string s = "{ " + std::string(ct) + " _a[2],_r; memcpy(_a,c->vreg[" +
+                        std::to_string(rn) + "]," + std::to_string(fsz * 2) + "); ";
+        s += "_r=_a[0]+_a[1]; c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" +
+             std::to_string(rd) + "][1]=0; ";
+        s += "memcpy(&c->vreg[" + std::to_string(rd) + "][0],&_r," + std::to_string(fsz) + "); }";
+        put(s);
+        return true;
+    }
+
     // BSL / BIT / BIF: bitwise select. All three are the same operation with a
     // different choice of which register supplies the mask and which the
     // destination, so size picks the variant rather than an element width.
