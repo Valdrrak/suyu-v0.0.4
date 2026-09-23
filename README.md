@@ -20,15 +20,18 @@ Nintendo Switch emulator and native recompiler — based on <a href="https://git
 
 ---
 
-> **This is the final public release of suyu — v0.04. This repository is a public archive.**
+> **This fork prepares the v0.0.4.1 startup hotfix for suyu v0.04.**
 >
-> No further development or downloads are planned. The codebase is preserved here under GPL-3.0 for historical reference and community use.
+> The upstream codebase is preserved under GPL-3.0. This fork provides a versioned
+> rebuild containing the debugger-pane initialization fix and a guard for builds
+> without MicroProfile, which otherwise can crash after selecting or restoring
+> an interface mode.
 >
 > **Note:** a small number of fixes were later pulled in from a community
 > continuation of this codebase, after users reported that installed
 > updates/DLC, service handler registration, and RomFS registration were all
 > broken in the archived build. Those fixes are folded in here as bug fixes to
-> suyu itself; this remains the same final v0.04 release, not new development.
+> suyu itself and are retained in this hotfix.
 
 ## About
 
@@ -41,9 +44,13 @@ Based on [Eden](https://git.eden-emu.dev/eden-emu/eden), with suyu's own improve
 
 ## Status
 
-Final version: **v0.04**. Automated builds are published to the [releases page](../../releases) by GitHub Actions (Windows, Linux, Android).
+Hotfix version: **v0.0.4.1**. GitHub Actions validates branch and pull-request builds.
+Pushing the `v0.0.4.1` tag publishes a separate [release](../../releases) only after
+the required builds succeed; previous releases are not deleted.
 
-Platforms: Windows, Linux, Android. macOS/iOS not included in this release.
+Windows packages must pass startup smoke tests in Gamer, Technical, and Hacker
+modes before publication. The workflow also builds Linux, macOS, Android, and
+Libretro targets, with optional FreeBSD and Android Libretro jobs.
 
 ## Legal Notice
 

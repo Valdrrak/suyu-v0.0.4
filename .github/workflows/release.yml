@@ -1,13 +1,18 @@
-name: Release v0.04 latest
+name: Release v0.0.4.1
 
 on:
-  schedule:
-    - cron: '0 0 1 * *'
-    - cron: '0 0 * * 0'
+  push:
+    branches: [main]
+    tags: ['v0.0.4.1']
+  pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build-windows:
@@ -59,6 +64,15 @@ jobs:
           Copy-Item build/bin/suyu.exe _pkg/
           Copy-Item build/bin/suyu-cmd.exe _pkg/
           windeployqt --release --no-translations _pkg/suyu.exe
+      - name: Test packaged startup
+        shell: pwsh
+        run: |
+          foreach ($mode in 'gamer', 'programmer', 'hacker') {
+            ./tools-local/Test-Startup.ps1 -ExecutablePath ./_pkg/suyu.exe -Mode $mode
+          }
+      - name: Archive package
+        shell: pwsh
+        run: |
           Compress-Archive -Path _pkg/* -DestinationPath suyu-windows-x64.zip
       - uses: actions/upload-artifact@v4
         with:
@@ -375,9 +389,11 @@ jobs:
 
   release:
     name: Publish Release
-    if: always()
+    if: ${{ success() && github.ref == 'refs/tags/v0.0.4.1' }}
     needs: [build-windows, build-linux, build-macos, build-freebsd, build-android, build-libretro, build-libretro-windows, build-libretro-android]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -385,25 +401,18 @@ jobs:
           path: artifacts
       - name: List artifacts
         run: find artifacts -type f || echo "No artifacts found"
-      - name: Delete existing release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release delete "v0.04-latest" --repo ${{ github.repository }} --yes 2>/dev/null || true
-          git push --delete origin "v0.04-latest" 2>/dev/null || true
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          FILES=$(find artifacts -type f -name '*.zip' -o -name '*.tar.gz' -o -name '*.apk')
-          if [ -z "$FILES" ]; then
+          mapfile -d '' FILES < <(find artifacts -type f \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.apk' \) -print0)
+          if [ "${#FILES[@]}" -eq 0 ]; then
             echo "No artifacts to release"
             exit 1
           fi
-          echo "Releasing: $FILES"
-          gh release create "v0.04-latest" \
-            --repo ${{ github.repository }} \
-            --title "suyu v0.04 latest" \
-            --notes "Automated build. Built by GitHub Actions." \
-            --prerelease \
-            $FILES
+          gh release create "v0.0.4.1" \
+            --verify-tag \
+            --title "suyu v0.0.4.1" \
+            --notes "Fix startup crashes when selecting or restoring an interface mode in builds without MicroProfile. Includes initialized debugger-pane pointers, a compile-time guard for the optional profiler, and Windows startup smoke tests for all three interface modes." \
+            "${FILES[@]}"
