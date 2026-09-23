@@ -20,7 +20,7 @@ Nintendo Switch emulator and native recompiler — based on <a href="https://git
 
 ---
 
-> **This fork prepares the v0.0.4.1 startup hotfix for suyu v0.04.**
+> **This fork provides the v0.0.4.1 startup hotfix for suyu v0.04.**
 >
 > The upstream codebase is preserved under GPL-3.0. This fork provides a versioned
 > rebuild containing the debugger-pane initialization fix and a guard for builds
@@ -44,13 +44,22 @@ Based on [Eden](https://git.eden-emu.dev/eden-emu/eden), with suyu's own improve
 
 ## Status
 
-Hotfix version: **v0.0.4.1**. GitHub Actions validates branch and pull-request builds.
-Pushing the `v0.0.4.1` tag publishes a separate [release](../../releases) only after
-the required builds succeed; previous releases are not deleted.
+Hotfix version: **v0.0.4.1**. See the [release page](../../releases/tag/v0.0.4.1)
+for the Windows portable download and its verification limits. Extract the whole
+archive and launch `suyu.exe`; keep its DLLs, plugins, and `user` folder together.
+
+GitHub Actions is configured to validate branch and pull-request builds. Its
+tag-publication job requires successful builds and preserves an existing release
+without replacing its assets.
 
 Windows packages must pass startup smoke tests in Gamer, Technical, and Hacker
 modes before publication. The workflow also builds Linux, macOS, Android, and
 Libretro targets, with optional FreeBSD and Android Libretro jobs.
+
+The Windows startup crash, source changes, and verified local portable build are
+documented in [Windows Startup Hotfix](docs/WINDOWS_STARTUP_HOTFIX.md). The local
+build was tested before publication; no personal settings, saves, keys, firmware,
+or games are included in the release archive.
 
 ## Legal Notice
 

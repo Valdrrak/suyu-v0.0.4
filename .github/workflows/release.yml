@@ -406,6 +406,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
+          RELEASE_EXISTS=$(gh release list --limit 100 --json tagName --jq 'any(.[]; .tagName == "v0.0.4.1")')
+          if [ "$RELEASE_EXISTS" = "true" ]; then
+            echo "Preserving the existing v0.0.4.1 release and its tested assets."
+            exit 0
+          fi
           mapfile -d '' FILES < <(find artifacts -type f \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.apk' \) -print0)
           if [ "${#FILES[@]}" -eq 0 ]; then
             echo "No artifacts to release"
